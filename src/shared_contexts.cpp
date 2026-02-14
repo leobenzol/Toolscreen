@@ -10,6 +10,25 @@ std::atomic<HGLRC> g_sharedMirrorContext{ nullptr };
 std::atomic<HDC> g_sharedContextDC{ nullptr };
 std::atomic<bool> g_sharedContextsReady{ false };
 
+// Helper: temporarily unbind the current context so wglShareLists can succeed.
+// Per WGL docs, neither context may be current when calling wglShareLists.
+struct ScopedWglUnbind {
+    HDC prevDC = NULL;
+    HGLRC prevRC = NULL;
+    bool unbound = false;
+    ScopedWglUnbind() {
+        prevRC = wglGetCurrentContext();
+        prevDC = wglGetCurrentDC();
+        if (prevRC) {
+            // Unbind only if there is a current context.
+            if (wglMakeCurrent(NULL, NULL)) { unbound = true; }
+        }
+    }
+    ~ScopedWglUnbind() {
+        if (unbound && prevRC && prevDC) { wglMakeCurrent(prevDC, prevRC); }
+    }
+};
+
 bool InitializeSharedContexts(void* gameGLContext, HDC hdc) {
     if (g_sharedContextsReady.load()) {
         return true; // Already initialized
@@ -22,65 +41,112 @@ bool InitializeSharedContexts(void* gameGLContext, HDC hdc) {
 
     HGLRC gameContext = (HGLRC)gameGLContext;
 
-    LogCategory("init", "SharedContexts: Initializing all shared contexts...");
+    Log("SharedContexts: Initializing all shared contexts...");
 
     // Store the DC for later use
     g_sharedContextDC.store(hdc);
 
-    // Create all contexts first (before any sharing)
-    HGLRC renderContext = wglCreateContext(hdc);
-    if (!renderContext) {
-        Log("SharedContexts: Failed to create render context (error " + std::to_string(GetLastError()) + ")");
-        return false;
+    // Preferred: Create contexts with WGL_ARB_create_context and share-at-create.
+    // This is more reliable with modern Minecraft (1.21+) contexts (core profiles, newer versions).
+    HGLRC renderContext = NULL;
+    HGLRC mirrorContext = NULL;
+
+    // Query current game context version/profile (best effort; defaults to 3.3 compat).
+    GLint major = 3, minor = 3;
+    GLint profileMask = 0;
+    GLint flags = 0;
+    // These queries require the game context to be current (it is, since we're in SwapBuffers).
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+    // GL_CONTEXT_PROFILE_MASK exists in 3.2+; if not present, it will return 0.
+    glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profileMask);
+    glGetIntegerv(GL_CONTEXT_FLAGS, &flags);
+    while (glGetError() != GL_NO_ERROR) {
+        // Swallow any errors from older contexts that don't support these enums.
     }
 
-    HGLRC mirrorContext = wglCreateContext(hdc);
-    if (!mirrorContext) {
-        Log("SharedContexts: Failed to create mirror context (error " + std::to_string(GetLastError()) + ")");
-        wglDeleteContext(renderContext);
-        return false;
-    }
+    if (wglCreateContextAttribsARB) {
+        int attribs[] = { WGL_CONTEXT_MAJOR_VERSION_ARB, major, WGL_CONTEXT_MINOR_VERSION_ARB, minor, WGL_CONTEXT_FLAGS_ARB, flags,
+                          // If profileMask is 0 (unknown), request compatibility (most permissive).
+                          WGL_CONTEXT_PROFILE_MASK_ARB, (profileMask != 0) ? profileMask : WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB, 0 };
 
-    LogCategory("init", "SharedContexts: Created 2 contexts, now sharing with game...");
-
-    // Now share all contexts with the game context
-    // wglShareLists must be called before any context is made current!
-
-    // Share render context with game
-    SetLastError(0);
-    if (!wglShareLists(gameContext, renderContext)) {
-        DWORD err = GetLastError();
-        // Try reverse order
-        if (!wglShareLists(renderContext, gameContext)) {
-            Log("SharedContexts: Failed to share render context (error " + std::to_string(err) + ", " + std::to_string(GetLastError()) +
-                ")");
-            wglDeleteContext(renderContext);
-            wglDeleteContext(mirrorContext);
-            return false;
+        renderContext = wglCreateContextAttribsARB(hdc, gameContext, attribs);
+        mirrorContext = wglCreateContextAttribsARB(hdc, gameContext, attribs);
+        if (renderContext && mirrorContext) {
+            Log("SharedContexts: Created shared contexts via wglCreateContextAttribsARB (" + std::to_string(major) + "." +
+                std::to_string(minor) + ")");
+        } else {
+            DWORD err = GetLastError();
+            Log("SharedContexts: wglCreateContextAttribsARB failed (error " + std::to_string(err) +
+                "), falling back to wglCreateContext + wglShareLists");
+            if (renderContext) {
+                wglDeleteContext(renderContext);
+                renderContext = NULL;
+            }
+            if (mirrorContext) {
+                wglDeleteContext(mirrorContext);
+                mirrorContext = NULL;
+            }
         }
     }
-    LogCategory("init", "SharedContexts: Render context shared with game");
 
-    // Share mirror context with game (since game is now in a share group, all must share with game)
-    SetLastError(0);
-    if (!wglShareLists(gameContext, mirrorContext)) {
-        DWORD err = GetLastError();
-        if (!wglShareLists(mirrorContext, gameContext)) {
-            Log("SharedContexts: Failed to share mirror context (error " + std::to_string(err) + ", " + std::to_string(GetLastError()) +
-                ")");
-            wglDeleteContext(renderContext);
-            wglDeleteContext(mirrorContext);
+    if (!renderContext || !mirrorContext) {
+        // Fallback: Create legacy contexts then share.
+        renderContext = wglCreateContext(hdc);
+        if (!renderContext) {
+            Log("SharedContexts: Failed to create render context (error " + std::to_string(GetLastError()) + ")");
             return false;
         }
+
+        mirrorContext = wglCreateContext(hdc);
+        if (!mirrorContext) {
+            Log("SharedContexts: Failed to create mirror context (error " + std::to_string(GetLastError()) + ")");
+            wglDeleteContext(renderContext);
+            return false;
+        }
+
+        Log("SharedContexts: Created 2 contexts (legacy), now sharing with game...");
+
+        // Now share all contexts with the game context.
+        // IMPORTANT: wglShareLists requires neither context to be current.
+        ScopedWglUnbind unbind;
+
+        // Share render context with game
+        SetLastError(0);
+        if (!wglShareLists(gameContext, renderContext)) {
+            DWORD err = GetLastError();
+            // Try reverse order
+            if (!wglShareLists(renderContext, gameContext)) {
+                Log("SharedContexts: Failed to share render context (error " + std::to_string(err) + ", " + std::to_string(GetLastError()) +
+                    ")");
+                wglDeleteContext(renderContext);
+                wglDeleteContext(mirrorContext);
+                return false;
+            }
+        }
+        Log("SharedContexts: Render context shared with game");
+
+        // Share mirror context with game
+        SetLastError(0);
+        if (!wglShareLists(gameContext, mirrorContext)) {
+            DWORD err = GetLastError();
+            if (!wglShareLists(mirrorContext, gameContext)) {
+                Log("SharedContexts: Failed to share mirror context (error " + std::to_string(err) + ", " + std::to_string(GetLastError()) +
+                    ")");
+                wglDeleteContext(renderContext);
+                wglDeleteContext(mirrorContext);
+                return false;
+            }
+        }
+        Log("SharedContexts: Mirror context shared with game");
     }
-    LogCategory("init", "SharedContexts: Mirror context shared with game");
 
     // All contexts created and shared successfully!
     g_sharedRenderContext.store(renderContext);
     g_sharedMirrorContext.store(mirrorContext);
     g_sharedContextsReady.store(true);
 
-    LogCategory("init", "SharedContexts: All contexts initialized and shared successfully");
+    Log("SharedContexts: All contexts initialized and shared successfully");
     return true;
 }
 

@@ -1420,6 +1420,11 @@ void StartMirrorCaptureThread(void* gameGLContext) {
         // Share OpenGL objects with game context - MUST happen on main thread while game context is current
         // wglShareLists(src, dst) - shares display lists and textures from src to dst
         // Try src=game, dst=capture first (game resources become available in capture context)
+        // IMPORTANT: wglShareLists requires neither context to be current.
+        HDC prevDC = wglGetCurrentDC();
+        HGLRC prevRC = wglGetCurrentContext();
+        if (prevRC) { wglMakeCurrent(NULL, NULL); }
+
         if (!wglShareLists((HGLRC)gameGLContext, g_mirrorCaptureContext)) {
             DWORD err1 = GetLastError();
             // Try reverse order
@@ -1428,9 +1433,12 @@ void StartMirrorCaptureThread(void* gameGLContext) {
                 Log("Mirror Capture Thread: wglShareLists failed (errors " + std::to_string(err1) + ", " + std::to_string(err2) + ")");
                 wglDeleteContext(g_mirrorCaptureContext);
                 g_mirrorCaptureContext = NULL;
+                if (prevRC && prevDC) { wglMakeCurrent(prevDC, prevRC); }
                 return;
             }
         }
+
+        if (prevRC && prevDC) { wglMakeCurrent(prevDC, prevRC); }
 
         Log("Mirror Capture Thread: Context created and shared on main thread (fallback mode)");
     }

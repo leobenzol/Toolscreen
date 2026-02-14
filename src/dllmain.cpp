@@ -181,6 +181,8 @@ std::atomic<bool> g_isTransitioningMode{ false };
 std::atomic<bool> g_skipViewportAnimation{ false }; // When true, viewport hook uses target position (for animations)
 std::atomic<int> g_wmMouseMoveCount{ 0 };
 
+static std::atomic<HGLRC> g_lastSeenGameGLContext{ NULL };
+
 ModeTransitionAnimation g_modeTransition;
 std::mutex g_modeTransitionMutex;
 // Lock-free snapshot for viewport hook
@@ -962,6 +964,14 @@ void WINAPI hkglBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuf
                                        filter);
     }
 
+    // Minecraft 1.21+ uses glBlitNamedFramebuffer extensively for internal post-processing blits between FBOs.
+    // Our coordinate remap is ONLY intended for the final blit into the default framebuffer.
+    // If we remap internal blits (drawFramebuffer != 0), we can corrupt the pipeline and end up with a black final frame.
+    if (drawFramebuffer != 0) {
+        return oglBlitNamedFramebuffer(readFramebuffer, drawFramebuffer, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask,
+                                       filter);
+    }
+
     // Get the current mode's viewport information to determine proper destination coordinates
     ModeViewportInfo viewport = GetCurrentModeViewport();
 
@@ -1166,6 +1176,9 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
                 LogCategory("init", "[RENDER] GLEW Initialized successfully.");
                 g_glewLoaded = true;
 
+                // Record the initial context used for sharing.
+                g_lastSeenGameGLContext.store(wglGetCurrentContext(), std::memory_order_release);
+
                 // Keep welcome toast system active; per-toast visibility is controlled by config toggles.
                 // We still keep touching the legacy "has_opened" marker when GUI is opened.
                 g_welcomeToastVisible.store(true);
@@ -1198,6 +1211,35 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
             }
         }
         if (g_isShuttingDown.load()) { return owglSwapBuffers(hDc); }
+
+        {
+            HGLRC currentContext = wglGetCurrentContext();
+            HGLRC lastContext = g_lastSeenGameGLContext.load(std::memory_order_acquire);
+            if (currentContext && lastContext && currentContext != lastContext) {
+                Log("[RENDER] Detected WGL context change - restarting shared contexts/threads");
+
+                StopObsHookThread();
+                StopMirrorCaptureThread();
+                StopRenderThread();
+
+                CleanupSharedContexts();
+
+                if (InitializeSharedContexts(currentContext, hDc)) {
+                    Log("[RENDER] Reinitialized shared contexts after context change");
+                    StartRenderThread(currentContext);
+                    StartMirrorCaptureThread(currentContext);
+                    StartObsHookThread();
+                } else {
+                    Log("[RENDER] Failed to reinitialize shared contexts after context change - async overlays may be unavailable");
+                }
+
+                // Force recache of game texture IDs in the new context.
+                g_cachedGameTextureId.store(UINT_MAX, std::memory_order_release);
+                g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
+            } else if (currentContext && (!lastContext)) {
+                g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
+            }
+        }
 
         // Start logic thread if not already running (handles OBS detection, hotkey resets, etc.)
         if (!g_logicThreadRunning.load() && g_configLoaded.load()) { StartLogicThread(); }
@@ -1479,9 +1521,7 @@ void main() {
                                         if (mon) {
                                             MONITORINFO mi{};
                                             mi.cbSize = sizeof(mi);
-                                            if (GetMonitorInfo(mon, &mi)) {
-                                                targetRect = mi.rcMonitor;
-                                            }
+                                            if (GetMonitorInfo(mon, &mi)) { targetRect = mi.rcMonitor; }
                                         }
                                         const int targetW = (targetRect.right - targetRect.left);
                                         const int targetH = (targetRect.bottom - targetRect.top);
@@ -1497,7 +1537,8 @@ void main() {
 
                                         // Remove edge styles and TOPMOST to avoid behaving like exclusive fullscreen.
                                         LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-                                        exStyle &= ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_TOPMOST);
+                                        exStyle &=
+                                            ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_TOPMOST);
                                         exStyle |= WS_EX_APPWINDOW;
                                         SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 

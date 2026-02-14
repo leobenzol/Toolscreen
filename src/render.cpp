@@ -3053,20 +3053,30 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
 
             // Memory barrier to ensure we see the latest texture data from render thread
             // This is critical for cross-context texture sharing under GPU load
-            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
 
             // Use pre-allocated static fullscreen quad VAO/VBO - no per-frame vertex upload needed
             glBindVertexArray(g_fullscreenQuadVAO);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, completedTexture);
 
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+
             // Use background shader (simpler passthrough, uniforms already set during init)
             glUseProgram(g_backgroundProgram);
             glUniform1f(g_backgroundShaderLocs.opacity, 1.0f);
 
-            // Enable premultiplied alpha blending for overlay compositing
+            // Composite async overlay using straight-alpha blending.
+            // The render_thread output is NOT premultiplied (ImGui OpenGL3 backend + our shaders output straight alpha).
             glEnable(GL_BLEND);
-            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
             glDrawArrays(GL_TRIANGLES, 0, 6);
 

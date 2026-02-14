@@ -2857,10 +2857,15 @@ static void RenderThreadFunc(void* gameGLContext) {
 
             // Bind FBO and set viewport
             glBindFramebuffer(GL_FRAMEBUFFER, writeFBO.fbo);
-            if (oglViewport) oglViewport(0, 0, request.fullW, request.fullH); else glViewport(0, 0, request.fullW, request.fullH);
+            if (oglViewport)
+                oglViewport(0, 0, request.fullW, request.fullH);
+            else
+                glViewport(0, 0, request.fullW, request.fullH);
 
             // Clear FBO - for OBS pass use mode background, otherwise transparent
             if (isObsRequest) {
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
                 // OBS pass: fill with mode background color first
                 glClearColor(request.bgR, request.bgG, request.bgB, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -3044,6 +3049,8 @@ static void RenderThreadFunc(void* gameGLContext) {
             } else {
                 // Non-OBS pass: transparent background so overlays composite on top of game
                 // Background/border rendering is done on main thread (render.cpp), we only render overlays here
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
                 glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
             }
@@ -3080,7 +3087,8 @@ static void RenderThreadFunc(void* gameGLContext) {
 
             // Early exit if nothing to render
             // BUT don't early exit if we need to render ImGui or the welcome toast (raw OpenGL)
-            if (activeMirrors.empty() && activeImages.empty() && activeWindowOverlayIds.empty() && !shouldRenderAnyImGui && !request.showWelcomeToast) {
+            if (activeMirrors.empty() && activeImages.empty() && activeWindowOverlayIds.empty() && !shouldRenderAnyImGui &&
+                !request.showWelcomeToast) {
                 // Still need to advance FBO and signal completion even if empty
                 // Create fence for synchronization
                 GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -3415,9 +3423,7 @@ static void RenderThreadFunc(void* gameGLContext) {
             }
 
             // Render welcome toast AFTER ImGui (raw OpenGL, renders on top of everything)
-            if (request.showWelcomeToast) {
-                RenderWelcomeToast(request.welcomeToastIsFullscreen);
-            }
+            if (request.showWelcomeToast) { RenderWelcomeToast(request.welcomeToastIsFullscreen); }
 
             // Create fence to signal when GPU completes all rendering commands
             // NOTE: Cursor is NOT rendered here - it's rendered separately below for virtual camera only
@@ -3475,7 +3481,10 @@ static void RenderThreadFunc(void* gameGLContext) {
 
                     // Render cursor onto the staging texture
                     glBindFramebuffer(GL_FRAMEBUFFER, g_vcCursorFBO);
-                    if (oglViewport) oglViewport(0, 0, vcW, vcH); else glViewport(0, 0, vcW, vcH);
+                    if (oglViewport)
+                        oglViewport(0, 0, vcW, vcH);
+                    else
+                        glViewport(0, 0, vcW, vcH);
 
                     int viewportX = request.isWindowed ? request.animatedX : 0;
                     int viewportY = request.isWindowed ? request.animatedY : 0;
@@ -3638,6 +3647,11 @@ void StartRenderThread(void* gameGLContext) {
         }
 
         // Share OpenGL objects with game context (textures, buffers - NOT shaders)
+        // IMPORTANT: wglShareLists requires neither context to be current.
+        HDC prevDC = wglGetCurrentDC();
+        HGLRC prevRC = wglGetCurrentContext();
+        if (prevRC) { wglMakeCurrent(NULL, NULL); }
+
         if (!wglShareLists((HGLRC)gameGLContext, g_renderThreadContext)) {
             DWORD err1 = GetLastError();
             if (!wglShareLists(g_renderThreadContext, (HGLRC)gameGLContext)) {
@@ -3645,9 +3659,12 @@ void StartRenderThread(void* gameGLContext) {
                 Log("Render Thread: wglShareLists failed (errors " + std::to_string(err1) + ", " + std::to_string(err2) + ")");
                 wglDeleteContext(g_renderThreadContext);
                 g_renderThreadContext = NULL;
+                if (prevRC && prevDC) { wglMakeCurrent(prevDC, prevRC); }
                 return;
             }
         }
+
+        if (prevRC && prevDC) { wglMakeCurrent(prevDC, prevRC); }
 
         Log("Render Thread: Context created and shared on main thread (fallback mode)");
     }
