@@ -1981,8 +1981,7 @@ void main() {
         // Optionally wait for all GPU rendering to complete before SwapBuffers
         if (frameCfg.debug.delayRenderingUntilFinished) { glFinish(); }
 
-        // Optionally wait for the async overlay blit fence to complete before SwapBuffers
-        if (frameCfg.debug.delayRenderingUntilBlitted) { WaitForOverlayBlitFence(); }
+        WaitForOverlayBlitFence();
 
         auto swapStartTime = std::chrono::high_resolution_clock::now();
         BOOL result = owglSwapBuffers(hDc);
