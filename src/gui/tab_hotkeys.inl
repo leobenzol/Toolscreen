@@ -208,12 +208,12 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                             if (strcmp(state, "generating") == 0) {
                                 // Special handling for "World Generation" - affects both "generating" and
                                 // "waiting"
-                                auto generateIt =
-                                    std::find(hotkey.conditions.gameState.begin(), hotkey.conditions.gameState.end(), "generating");
-                                auto waitingIt =
-                                    std::find(hotkey.conditions.gameState.begin(), hotkey.conditions.gameState.end(), "waiting");
-
                                 if (is_selected) {
+                                    auto generateIt = std::find(hotkey.conditions.gameState.begin(), hotkey.conditions.gameState.end(),
+                                                               "generating");
+                                    auto waitingIt = std::find(hotkey.conditions.gameState.begin(), hotkey.conditions.gameState.end(),
+                                                              "waiting");
+
                                     if (generateIt == hotkey.conditions.gameState.end()) {
                                         hotkey.conditions.gameState.push_back("generating");
                                     }
@@ -221,8 +221,11 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                                         hotkey.conditions.gameState.push_back("waiting");
                                     }
                                 } else {
-                                    if (generateIt != hotkey.conditions.gameState.end()) { hotkey.conditions.gameState.erase(generateIt); }
-                                    if (waitingIt != hotkey.conditions.gameState.end()) { hotkey.conditions.gameState.erase(waitingIt); }
+                                    // IMPORTANT: std::vector::erase invalidates iterators at/after the erase point.
+                                    // Erase by value (erase-remove) to avoid using invalidated iterators.
+                                    auto& gs = hotkey.conditions.gameState;
+                                    gs.erase(std::remove(gs.begin(), gs.end(), "waiting"), gs.end());
+                                    gs.erase(std::remove(gs.begin(), gs.end(), "generating"), gs.end());
                                 }
                             } else {
                                 // Normal handling for other states
@@ -453,12 +456,12 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                         if (ImGui::Checkbox((std::string(friendlyName) + "##sens").c_str(), &is_selected)) {
                             if (strcmp(state, "generating") == 0) {
                                 // Special handling for "World Generation" - affects both "generating" and "waiting"
-                                auto generateIt =
-                                    std::find(sensHotkey.conditions.gameState.begin(), sensHotkey.conditions.gameState.end(), "generating");
-                                auto waitingIt =
-                                    std::find(sensHotkey.conditions.gameState.begin(), sensHotkey.conditions.gameState.end(), "waiting");
-
                                 if (is_selected) {
+                                    auto generateIt = std::find(sensHotkey.conditions.gameState.begin(), sensHotkey.conditions.gameState.end(),
+                                                               "generating");
+                                    auto waitingIt = std::find(sensHotkey.conditions.gameState.begin(), sensHotkey.conditions.gameState.end(),
+                                                              "waiting");
+
                                     if (generateIt == sensHotkey.conditions.gameState.end()) {
                                         sensHotkey.conditions.gameState.push_back("generating");
                                     }
@@ -466,12 +469,11 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                                         sensHotkey.conditions.gameState.push_back("waiting");
                                     }
                                 } else {
-                                    if (generateIt != sensHotkey.conditions.gameState.end()) {
-                                        sensHotkey.conditions.gameState.erase(generateIt);
-                                    }
-                                    if (waitingIt != sensHotkey.conditions.gameState.end()) {
-                                        sensHotkey.conditions.gameState.erase(waitingIt);
-                                    }
+                                    // IMPORTANT: std::vector::erase invalidates iterators at/after the erase point.
+                                    // Erase by value (erase-remove) to avoid using invalidated iterators.
+                                    auto& gs = sensHotkey.conditions.gameState;
+                                    gs.erase(std::remove(gs.begin(), gs.end(), "waiting"), gs.end());
+                                    gs.erase(std::remove(gs.begin(), gs.end(), "generating"), gs.end());
                                 }
                             } else {
                                 // Normal handling for other states
