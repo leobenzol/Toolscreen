@@ -410,8 +410,25 @@ void ProcessPendingDimensionChange() {
     // Find the mode and apply dimension changes
     ModeConfig* mode = GetModeMutable(g_pendingDimensionChange.modeId);
     if (mode) {
-        if (g_pendingDimensionChange.newWidth > 0) { mode->width = g_pendingDimensionChange.newWidth; }
-        if (g_pendingDimensionChange.newHeight > 0) { mode->height = g_pendingDimensionChange.newHeight; }
+        // NOTE: The GUI spinners represent an explicit switch to absolute pixel sizing.
+        // If a mode was previously driven by an expression (e.g. Thin/Wide defaults) or
+        // by percentage sizing, changing the spinner should disable that and persist the
+        // new numeric value.
+        if (g_pendingDimensionChange.newWidth > 0) {
+            mode->width = g_pendingDimensionChange.newWidth;
+            mode->widthExpr.clear();
+            mode->relativeWidth = -1.0f;
+        }
+        if (g_pendingDimensionChange.newHeight > 0) {
+            mode->height = g_pendingDimensionChange.newHeight;
+            mode->heightExpr.clear();
+            mode->relativeHeight = -1.0f;
+        }
+
+        // If no relative sizing remains, clear the flag (keeps UI/serialization consistent).
+        const bool hasRelativeWidth = (mode->relativeWidth >= 0.0f && mode->relativeWidth <= 1.0f);
+        const bool hasRelativeHeight = (mode->relativeHeight >= 0.0f && mode->relativeHeight <= 1.0f);
+        if (!hasRelativeWidth && !hasRelativeHeight) { mode->useRelativeSize = false; }
 
         // Post WM_SIZE if requested and this is the current mode
         if (g_pendingDimensionChange.sendWmSize && g_currentModeId == g_pendingDimensionChange.modeId) {

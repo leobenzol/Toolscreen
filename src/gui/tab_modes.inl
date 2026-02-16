@@ -56,7 +56,7 @@
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
                     g_pendingDimensionChange.newWidth = tempWidth;
-                    g_pendingDimensionChange.newHeight = mode.height; // Keep current height
+                    g_pendingDimensionChange.newHeight = 0; // Unchanged
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
                 ImGui::NextColumn();
@@ -68,7 +68,7 @@
                     std::lock_guard<std::mutex> lock(g_pendingDimensionChangeMutex);
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
-                    g_pendingDimensionChange.newWidth = mode.width; // Keep current width
+                    g_pendingDimensionChange.newWidth = 0; // Unchanged
                     g_pendingDimensionChange.newHeight = tempHeight;
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
@@ -317,7 +317,7 @@
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
                     g_pendingDimensionChange.newWidth = tempWidth2;
-                    g_pendingDimensionChange.newHeight = mode.height;
+                    g_pendingDimensionChange.newHeight = 0; // Unchanged
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
                 ImGui::NextColumn();
@@ -328,7 +328,7 @@
                     std::lock_guard<std::mutex> lock(g_pendingDimensionChangeMutex);
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
-                    g_pendingDimensionChange.newWidth = mode.width;
+                    g_pendingDimensionChange.newWidth = 0; // Unchanged
                     g_pendingDimensionChange.newHeight = tempHeight2;
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
@@ -889,7 +889,7 @@
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
                     g_pendingDimensionChange.newWidth = tempWidth3;
-                    g_pendingDimensionChange.newHeight = mode.height;
+                    g_pendingDimensionChange.newHeight = 0; // Unchanged
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
                 ImGui::NextColumn();
@@ -900,7 +900,7 @@
                     std::lock_guard<std::mutex> lock(g_pendingDimensionChangeMutex);
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
-                    g_pendingDimensionChange.newWidth = mode.width;
+                    g_pendingDimensionChange.newWidth = 0; // Unchanged
                     g_pendingDimensionChange.newHeight = tempHeight3;
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
@@ -1230,7 +1230,7 @@
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
                     g_pendingDimensionChange.newWidth = tempWidth4;
-                    g_pendingDimensionChange.newHeight = mode.height;
+                    g_pendingDimensionChange.newHeight = 0; // Unchanged
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
                 ImGui::NextColumn();
@@ -1241,7 +1241,7 @@
                     std::lock_guard<std::mutex> lock(g_pendingDimensionChangeMutex);
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
-                    g_pendingDimensionChange.newWidth = mode.width;
+                    g_pendingDimensionChange.newWidth = 0; // Unchanged
                     g_pendingDimensionChange.newHeight = tempHeight4;
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
@@ -1636,7 +1636,7 @@
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
                     g_pendingDimensionChange.newWidth = tempWidth5;
-                    g_pendingDimensionChange.newHeight = mode.height;
+                    g_pendingDimensionChange.newHeight = 0; // Unchanged
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
                 ImGui::NextColumn();
@@ -1647,7 +1647,7 @@
                     std::lock_guard<std::mutex> lock(g_pendingDimensionChangeMutex);
                     g_pendingDimensionChange.pending = true;
                     g_pendingDimensionChange.modeId = mode.id;
-                    g_pendingDimensionChange.newWidth = mode.width;
+                    g_pendingDimensionChange.newWidth = 0; // Unchanged
                     g_pendingDimensionChange.newHeight = tempHeight5;
                     g_pendingDimensionChange.sendWmSize = (g_currentModeId == mode.id);
                 }
