@@ -1526,28 +1526,35 @@ void main() {
                                         const int targetW = (targetRect.right - targetRect.left);
                                         const int targetH = (targetRect.bottom - targetRect.top);
 
-                                        // Ensure we are not maximized/minimized; some games set TOPMOST/maximize during fullscreen.
-                                        ShowWindow(hwnd, SW_RESTORE);
+                                        if (IsIconic(hwnd)) {
+                                            WINDOWPLACEMENT wp{};
+                                            wp.length = sizeof(wp);
+                                            if (GetWindowPlacement(hwnd, &wp)) {
+                                                switch (wp.showCmd) {
+                                                case SW_SHOWMAXIMIZED:
+                                                    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                                                    break;
+                                                case SW_SHOWMINIMIZED:
+                                                    ShowWindow(hwnd, SW_RESTORE);
+                                                    break;
+                                                default:
+                                                    ShowWindow(hwnd, SW_NORMAL);
+                                                    break;
+                                                }
+                                            } else {
+                                                ShowWindow(hwnd, SW_RESTORE);
+                                            }
+                                        }
 
-                                        // Borderless windowed: popup style with no frame.
-                                        LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-                                        style &= ~(WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME);
-                                        style |= (WS_POPUP | WS_VISIBLE);
-                                        SetWindowLongPtr(hwnd, GWL_STYLE, style);
+                                        {
+                                            DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
+                                            constexpr DWORD kBorderlessStyleMask =
+                                                ~(WS_BORDER | WS_DLGFRAME | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+                                            style &= kBorderlessStyleMask;
+                                            SetWindowLongPtr(hwnd, GWL_STYLE, static_cast<LONG_PTR>(style));
+                                        }
 
-                                        // Remove edge styles and TOPMOST to avoid behaving like exclusive fullscreen.
-                                        LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-                                        exStyle &=
-                                            ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_TOPMOST);
-                                        exStyle |= WS_EX_APPWINDOW;
-                                        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
-
-                                        // Apply size/pos and ensure we are not topmost.
-                                        SetWindowPos(hwnd, HWND_NOTOPMOST, targetRect.left, targetRect.top, targetW, targetH,
-                                                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-
-                                        // Notify the game of the new client size.
-                                        PostMessage(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(targetW, targetH));
+                                        MoveWindow(hwnd, targetRect.left, targetRect.top, targetW, targetH, TRUE);
                                         g_cachedGameTextureId.store(UINT_MAX);
 
                                         Log("[TOAST] toast1 clicked - switched to borderless fullscreen " + std::to_string(targetW) + "x" +
