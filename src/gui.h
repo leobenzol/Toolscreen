@@ -330,6 +330,15 @@ struct HotkeyConfig {
     HotkeyConditions conditions;
     int debounce = 100;
     bool triggerOnRelease = false; // When true, hotkey triggers on key release instead of key press
+
+    // When true, the key event that matched this hotkey is consumed and NOT forwarded to the game.
+    // The hotkey still triggers normally.
+    bool blockKeyFromGame = false;
+
+    // When true, exiting the active secondary mode back to Fullscreen is allowed even if
+    // the current game state does not match this hotkey's required game states.
+    // Entering the secondary mode still respects required game states.
+    bool allowExitToFullscreenRegardlessOfGameState = false;
 };
 
 // Sensitivity hotkey - temporarily overrides mouse sensitivity until next mode change

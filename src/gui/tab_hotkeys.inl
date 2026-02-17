@@ -170,6 +170,21 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     ImGui::SetTooltip("When checked, the hotkey triggers when the key is released instead of pressed");
                 }
 
+                if (ImGui::Checkbox("Block key from game", &hotkey.blockKeyFromGame)) { g_configIsDirty = true; }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("When enabled, the key event that matches this hotkey is consumed and will NOT be forwarded to the game.\n"
+                                     "The hotkey will still trigger normally.");
+                }
+
+                if (ImGui::Checkbox("Allow exit to Fullscreen regardless of game state",
+                                   &hotkey.allowExitToFullscreenRegardlessOfGameState)) {
+                    g_configIsDirty = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("When enabled, toggling BACK to Fullscreen is allowed even if required game states are not met.\n"
+                                     "Toggling INTO the target mode still requires the configured game state.");
+                }
+
                 if (ImGui::TreeNode("Required Game States")) {
                     // Check if "Any" state is active (empty gameState array)
                     bool isAnySelected = hotkey.conditions.gameState.empty();

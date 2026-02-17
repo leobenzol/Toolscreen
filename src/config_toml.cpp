@@ -1054,6 +1054,9 @@ void HotkeyConfigToToml(const HotkeyConfig& cfg, toml::table& out) {
 
     out.insert("debounce", cfg.debounce);
     out.insert("triggerOnRelease", cfg.triggerOnRelease);
+
+    out.insert("blockKeyFromGame", cfg.blockKeyFromGame);
+    out.insert("allowExitToFullscreenRegardlessOfGameState", cfg.allowExitToFullscreenRegardlessOfGameState);
 }
 
 void HotkeyConfigFromToml(const toml::table& tbl, HotkeyConfig& cfg) {
@@ -1082,6 +1085,9 @@ void HotkeyConfigFromToml(const toml::table& tbl, HotkeyConfig& cfg) {
 
     cfg.debounce = GetOr(tbl, "debounce", ConfigDefaults::HOTKEY_DEBOUNCE);
     cfg.triggerOnRelease = GetOr(tbl, "triggerOnRelease", false);
+
+    cfg.blockKeyFromGame = GetOr(tbl, "blockKeyFromGame", false);
+    cfg.allowExitToFullscreenRegardlessOfGameState = GetOr(tbl, "allowExitToFullscreenRegardlessOfGameState", false);
     // Note: currentSecondaryMode is now tracked separately via thread-safe
     // Get/SetHotkeySecondaryMode() API - initialized by ResetAllHotkeySecondaryModes() after load
 }

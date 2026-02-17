@@ -498,50 +498,66 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
     PROFILE_SCOPE("HandleHotkeys");
 
     // Determine the virtual key code based on message type
-    DWORD vkCode = 0;
+    DWORD rawVkCode = 0;
+    DWORD vkCode = 0; // Normalized (left/right variants for Ctrl/Shift/Alt)
     bool isKeyDown = false;
 
     if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
-        vkCode = static_cast<DWORD>(wParam);
+        rawVkCode = static_cast<DWORD>(wParam);
         isKeyDown = true;
     } else if (uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
-        vkCode = static_cast<DWORD>(wParam);
+        rawVkCode = static_cast<DWORD>(wParam);
         isKeyDown = false;
     } else if (uMsg == WM_XBUTTONDOWN) {
         // Side mouse buttons (Mouse 4/5)
         WORD xButton = GET_XBUTTON_WPARAM(wParam);
-        vkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        rawVkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
         isKeyDown = true;
     } else if (uMsg == WM_XBUTTONUP) {
         WORD xButton = GET_XBUTTON_WPARAM(wParam);
-        vkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        rawVkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
         isKeyDown = false;
     } else if (uMsg == WM_LBUTTONDOWN) {
-        vkCode = VK_LBUTTON;
+        rawVkCode = VK_LBUTTON;
         isKeyDown = true;
     } else if (uMsg == WM_LBUTTONUP) {
-        vkCode = VK_LBUTTON;
+        rawVkCode = VK_LBUTTON;
         isKeyDown = false;
     } else if (uMsg == WM_RBUTTONDOWN) {
-        vkCode = VK_RBUTTON;
+        rawVkCode = VK_RBUTTON;
         isKeyDown = true;
     } else if (uMsg == WM_RBUTTONUP) {
-        vkCode = VK_RBUTTON;
+        rawVkCode = VK_RBUTTON;
         isKeyDown = false;
     } else if (uMsg == WM_MBUTTONDOWN) {
-        vkCode = VK_MBUTTON;
+        rawVkCode = VK_MBUTTON;
         isKeyDown = true;
     } else if (uMsg == WM_MBUTTONUP) {
-        vkCode = VK_MBUTTON;
+        rawVkCode = VK_MBUTTON;
         isKeyDown = false;
     } else {
         return { false, 0 };
     }
 
+    // Normalize generic modifier VKs to left/right variants (needed for RSHIFT/RCTRL/RALT, etc.).
+    // This mirrors imgui_impl_win32 behavior and enables reliable hotkeys + key rebinding.
+    vkCode = rawVkCode;
+    if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN || uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
+        if (vkCode == VK_SHIFT) {
+            vkCode = static_cast<DWORD>(::MapVirtualKeyW((UINT)((lParam >> 16) & 0xff), MAPVK_VSC_TO_VK_EX));
+        } else if (vkCode == VK_CONTROL) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RCONTROL : VK_LCONTROL;
+        } else if (vkCode == VK_MENU) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RMENU : VK_LMENU;
+        }
+        if (vkCode == 0) vkCode = rawVkCode;
+    }
+
     if (!IsResolutionChangeSupported(g_gameVersion)) { return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) }; }
 
     // Lock-free check of hotkey main keys - acceptable to race (worst case: miss one keypress)
-    if (g_hotkeyMainKeys.find(vkCode) == g_hotkeyMainKeys.end()) {
+    // Check both raw and normalized VK so Shift/Ctrl/Alt variants and generic VKs are handled.
+    if (g_hotkeyMainKeys.find(rawVkCode) == g_hotkeyMainKeys.end() && g_hotkeyMainKeys.find(vkCode) == g_hotkeyMainKeys.end()) {
         // This key is not a hotkey main key, but it might invalidate pending trigger-on-release hotkeys
         if (isKeyDown) {
             std::lock_guard<std::mutex> lock(g_triggerOnReleaseMutex);
@@ -558,7 +574,10 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
     bool s_enableHotkeyDebug = cfg.debug.showHotkeyDebug;
 
-    if (s_enableHotkeyDebug) { Log("[Hotkey] Key/button pressed: " + std::to_string(vkCode) + " in mode: " + currentModeId); }
+    if (s_enableHotkeyDebug) {
+        Log("[Hotkey] Key/button pressed: " + std::to_string(vkCode) + " (raw=" + std::to_string(rawVkCode) + ") in mode: " +
+            currentModeId);
+    }
     if (s_enableHotkeyDebug) {
         Log("[Hotkey] Current game state: " + gameState);
         Log("[Hotkey] Evaluating " + std::to_string(cfg.hotkeys.size()) + " configured hotkeys");
@@ -571,12 +590,25 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 ")");
         }
 
+        // Game-state conditions normally gate ALL transitions.
+        // Optional behavior: allow exiting the current secondary mode back to Fullscreen even if game state doesn't match.
         bool conditionsMet = hotkey.conditions.gameState.empty() ||
                              std::find(hotkey.conditions.gameState.begin(), hotkey.conditions.gameState.end(), gameState) !=
                                  hotkey.conditions.gameState.end();
+
+        // Determine if this hotkey is currently in its active secondary mode (meaning main hotkey would exit to Fullscreen).
+        // Note: GetHotkeySecondaryMode is thread-safe.
+        std::string currentSecMode = GetHotkeySecondaryMode(hotkeyIdx);
+        bool wouldExitToFullscreen = !currentSecMode.empty() && EqualsIgnoreCase(currentModeId, currentSecMode);
+
         if (!conditionsMet) {
-            if (s_enableHotkeyDebug) { Log("[Hotkey] SKIP: Game state conditions not met"); }
-            continue;
+            if (!(hotkey.allowExitToFullscreenRegardlessOfGameState && wouldExitToFullscreen)) {
+                if (s_enableHotkeyDebug) { Log("[Hotkey] SKIP: Game state conditions not met"); }
+                continue;
+            }
+            if (s_enableHotkeyDebug) {
+                Log("[Hotkey] BYPASS: Allowing exit to Fullscreen even though game state conditions are not met");
+            }
         }
 
         // Check Alt secondary mode hotkeys first
@@ -595,6 +627,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                         g_triggerOnReleasePending.insert(hotkeyId);
                         if (s_enableHotkeyDebug) { Log("[Hotkey] Alt trigger-on-release hotkey pressed, added to pending: " + hotkeyId); }
                         // Pass through the key-down event to the game so modifier keys work with other combos
+                        if (hotkey.blockKeyFromGame) return { true, 0 };
                         return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                     } else {
                         // Key released - check if invalidated
@@ -608,6 +641,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                         if (wasInvalidated) {
                             if (s_enableHotkeyDebug) { Log("[Hotkey] Alt trigger-on-release hotkey invalidated: " + hotkeyId); }
+                            if (hotkey.blockKeyFromGame) return { true, 0 };
                             return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                         }
                     }
@@ -622,6 +656,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                         std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hotkeyTimestamps[hotkeyId]).count() <
                             hotkey.debounce) {
                         if (s_enableHotkeyDebug) { Log("[Hotkey] Alt hotkey matched but debounced: " + hotkeyId); }
+                        if (hotkey.blockKeyFromGame) return { true, 0 };
                         return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                     }
                     g_hotkeyTimestamps[hotkeyId] = now;
@@ -634,6 +669,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                     if (!newSecMode.empty()) { SwitchToMode(newSecMode, "alt hotkey"); }
                 }
+                if (hotkey.blockKeyFromGame) return { true, 0 };
                 return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
             }
         }
@@ -655,6 +691,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     g_triggerOnReleasePending.insert(hotkeyId);
                     if (s_enableHotkeyDebug) { Log("[Hotkey] Trigger-on-release hotkey pressed, added to pending: " + hotkeyId); }
                     // Pass through the key-down event to the game so modifier keys work with other combos
+                    if (hotkey.blockKeyFromGame) return { true, 0 };
                     return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                 } else {
                     // Key released - check if invalidated
@@ -671,6 +708,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                         if (s_enableHotkeyDebug) {
                             Log("[Hotkey] Trigger-on-release hotkey invalidated (another key was pressed): " + hotkeyId);
                         }
+                        if (hotkey.blockKeyFromGame) return { true, 0 };
                         return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                     }
                     // Fall through to trigger the hotkey
@@ -685,13 +723,13 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 if (g_hotkeyTimestamps.count(hotkeyId) &&
                     std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hotkeyTimestamps[hotkeyId]).count() < hotkey.debounce) {
                     if (s_enableHotkeyDebug) { Log("[Hotkey] Main hotkey matched but debounced: " + hotkeyId); }
+                    if (hotkey.blockKeyFromGame) return { true, 0 };
                     return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
                 }
                 g_hotkeyTimestamps[hotkeyId] = now;
 
                 // Lock-free read of current mode ID from double-buffer
                 std::string current = g_modeIdBuffers[g_currentModeIdIndex.load(std::memory_order_acquire)];
-                std::string currentSecMode = GetHotkeySecondaryMode(hotkeyIdx);
                 std::string targetMode;
 
                 if (EqualsIgnoreCase(current, currentSecMode)) {
@@ -706,6 +744,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                 if (!targetMode.empty()) { SwitchToMode(targetMode, "main hotkey"); }
             }
+            if (hotkey.blockKeyFromGame) return { true, 0 };
             return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
         }
     }
@@ -919,62 +958,99 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
     PROFILE_SCOPE("HandleKeyRebinding");
 
     // Determine the virtual key code based on message type
-    DWORD vkCode = 0;
+    DWORD rawVkCode = 0;
+    DWORD vkCode = 0; // Normalized (left/right variants for Ctrl/Shift/Alt)
     bool isMouseButton = false;
     bool isKeyDown = false;
 
     if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
-        vkCode = static_cast<DWORD>(wParam);
+        rawVkCode = static_cast<DWORD>(wParam);
         isKeyDown = true;
     } else if (uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
-        vkCode = static_cast<DWORD>(wParam);
+        rawVkCode = static_cast<DWORD>(wParam);
         isKeyDown = false;
     } else if (uMsg == WM_XBUTTONDOWN) {
         WORD xButton = GET_XBUTTON_WPARAM(wParam);
-        vkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        rawVkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
         isMouseButton = true;
         isKeyDown = true;
     } else if (uMsg == WM_XBUTTONUP) {
         WORD xButton = GET_XBUTTON_WPARAM(wParam);
-        vkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        rawVkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
         isMouseButton = true;
         isKeyDown = false;
     } else if (uMsg == WM_LBUTTONDOWN) {
-        vkCode = VK_LBUTTON;
+        rawVkCode = VK_LBUTTON;
         isMouseButton = true;
         isKeyDown = true;
     } else if (uMsg == WM_LBUTTONUP) {
-        vkCode = VK_LBUTTON;
+        rawVkCode = VK_LBUTTON;
         isMouseButton = true;
         isKeyDown = false;
     } else if (uMsg == WM_RBUTTONDOWN) {
-        vkCode = VK_RBUTTON;
+        rawVkCode = VK_RBUTTON;
         isMouseButton = true;
         isKeyDown = true;
     } else if (uMsg == WM_RBUTTONUP) {
-        vkCode = VK_RBUTTON;
+        rawVkCode = VK_RBUTTON;
         isMouseButton = true;
         isKeyDown = false;
     } else if (uMsg == WM_MBUTTONDOWN) {
-        vkCode = VK_MBUTTON;
+        rawVkCode = VK_MBUTTON;
         isMouseButton = true;
         isKeyDown = true;
     } else if (uMsg == WM_MBUTTONUP) {
-        vkCode = VK_MBUTTON;
+        rawVkCode = VK_MBUTTON;
         isMouseButton = true;
         isKeyDown = false;
     } else {
         return { false, 0 };
     }
 
+    // Normalize generic modifier VKs to left/right variants so rebinds like VK_RSHIFT work.
+    vkCode = rawVkCode;
+    if (!isMouseButton && (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN || uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP)) {
+        if (vkCode == VK_SHIFT) {
+            vkCode = static_cast<DWORD>(::MapVirtualKeyW((UINT)((lParam >> 16) & 0xff), MAPVK_VSC_TO_VK_EX));
+        } else if (vkCode == VK_CONTROL) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RCONTROL : VK_LCONTROL;
+        } else if (vkCode == VK_MENU) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RMENU : VK_LMENU;
+        }
+        if (vkCode == 0) vkCode = rawVkCode;
+    }
+
     // Use config snapshot for thread-safe access to key rebinds
     auto rebindCfg = GetConfigSnapshot();
     if (!rebindCfg || !rebindCfg->keyRebinds.enabled) { return { false, 0 }; }
 
+    auto matchesFromKey = [&](DWORD incomingVk, DWORD incomingRawVk, DWORD fromKey) -> bool {
+        if (fromKey == 0) return false;
+        if (incomingVk == fromKey) return true;
+
+        // Allow generic modifiers to match either left/right variant.
+        if (fromKey == VK_CONTROL) {
+            return incomingVk == VK_LCONTROL || incomingVk == VK_RCONTROL || incomingRawVk == VK_CONTROL;
+        }
+        if (fromKey == VK_SHIFT) {
+            return incomingVk == VK_LSHIFT || incomingVk == VK_RSHIFT || incomingRawVk == VK_SHIFT;
+        }
+        if (fromKey == VK_MENU) {
+            return incomingVk == VK_LMENU || incomingVk == VK_RMENU || incomingRawVk == VK_MENU;
+        }
+
+        // Also allow left/right modifier bindings to match generic incoming VK_*.
+        if (incomingRawVk == VK_CONTROL && (fromKey == VK_LCONTROL || fromKey == VK_RCONTROL)) return true;
+        if (incomingRawVk == VK_SHIFT && (fromKey == VK_LSHIFT || fromKey == VK_RSHIFT)) return true;
+        if (incomingRawVk == VK_MENU && (fromKey == VK_LMENU || fromKey == VK_RMENU)) return true;
+
+        return false;
+    };
+
     for (size_t i = 0; i < rebindCfg->keyRebinds.rebinds.size(); ++i) {
         const auto& rebind = rebindCfg->keyRebinds.rebinds[i];
 
-        if (rebind.enabled && rebind.fromKey != 0 && rebind.toKey != 0 && vkCode == rebind.fromKey) {
+        if (rebind.enabled && rebind.fromKey != 0 && rebind.toKey != 0 && matchesFromKey(vkCode, rawVkCode, rebind.fromKey)) {
             DWORD outputVK;
             UINT outputScanCode;
 

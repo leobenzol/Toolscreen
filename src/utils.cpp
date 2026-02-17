@@ -1701,6 +1701,18 @@ bool CheckHotkeyMatch(const std::vector<DWORD>& keys, WPARAM wParam, const std::
     bool main_key_pressed = (main_key == wParam);
 
     if (!main_key_pressed) {
+        // Also support the inverse: bindings may use generic VK_* while the caller passes
+        // left/right variants (after resolving from scan code / extended flag).
+        if (main_key == VK_CONTROL && (wParam == VK_LCONTROL || wParam == VK_RCONTROL)) {
+            main_key_pressed = true;
+        } else if (main_key == VK_SHIFT && (wParam == VK_LSHIFT || wParam == VK_RSHIFT)) {
+            main_key_pressed = true;
+        } else if (main_key == VK_MENU && (wParam == VK_LMENU || wParam == VK_RMENU)) {
+            main_key_pressed = true;
+        }
+    }
+
+    if (!main_key_pressed) {
         // Check if wParam is a generic modifier and main_key is a specific variant
         if (wParam == VK_CONTROL && (main_key == VK_LCONTROL || main_key == VK_RCONTROL)) {
             if (triggerOnRelease) {
