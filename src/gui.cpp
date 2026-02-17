@@ -1612,6 +1612,15 @@ void SaveTheme() {
         toml::table tbl;
         tbl.insert_or_assign("theme", g_config.appearance.theme);
 
+        // Persist custom palette alongside the theme name so edits survive restarts
+        // even if the main config save is throttled or theme.toml overrides config theme.
+        // Always write the table (even if empty) so "Reset" reliably clears saved overrides.
+        toml::table colorsTbl;
+        for (const auto& [name, color] : g_config.appearance.customColors) {
+            colorsTbl.insert(name, ColorToTomlArray(color));
+        }
+        tbl.insert_or_assign("customColors", colorsTbl);
+
         std::string narrowPath = WideToUtf8(themePath);
         std::ofstream o(narrowPath);
         if (!o.is_open()) {
@@ -1648,6 +1657,19 @@ void LoadTheme() {
             std::string themeName = tbl["theme"].value_or<std::string>("Dark");
             g_config.appearance.theme = themeName;
             Log("Loaded theme from theme.toml: " + themeName);
+        }
+
+        // Optional: load custom palette from theme.toml (newer versions store it here).
+        if (const toml::node* ccNode = tbl.get("customColors")) {
+            if (const toml::table* colorsTbl = ccNode->as_table()) {
+                g_config.appearance.customColors.clear();
+                for (const auto& [key, value] : *colorsTbl) {
+                    if (auto arr = value.as_array()) {
+                        g_config.appearance.customColors[std::string(key.str())] =
+                            ColorFromTomlArray(arr, { 0.0f, 0.0f, 0.0f, 1.0f });
+                    }
+                }
+            }
         }
     } catch (const toml::parse_error& e) {
         Log("ERROR: Failed to parse theme.toml: " + std::string(e.what()));

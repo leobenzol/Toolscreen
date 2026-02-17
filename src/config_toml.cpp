@@ -1339,8 +1339,10 @@ void KeyRebindsConfigFromToml(const toml::table& tbl, KeyRebindsConfig& cfg) {
 void AppearanceConfigToToml(const AppearanceConfig& cfg, toml::table& out) {
     out.insert("theme", cfg.theme);
 
-    // Only save custom colors if theme is "Custom" and there are custom colors
-    if (cfg.theme == "Custom" && !cfg.customColors.empty()) {
+    // Save custom colors whenever present.
+    // Rationale: users may customize colors, then switch to a preset theme temporarily.
+    // Keeping the custom palette in the config allows switching back to "Custom" without losing edits.
+    if (!cfg.customColors.empty()) {
         toml::table colorsTbl;
         for (const auto& [name, color] : cfg.customColors) { colorsTbl.insert(name, ColorToTomlArray(color)); }
         out.insert("customColors", colorsTbl);
