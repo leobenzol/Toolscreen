@@ -86,6 +86,20 @@ void RegisterBindingInputEvent(UINT uMsg, WPARAM wParam, LPARAM lParam) {
         DWORD resolvedVk = static_cast<DWORD>(keyWParam);
         if (mappedVk != 0) { resolvedVk = static_cast<DWORD>(mappedVk); }
 
+        // Normalize generic modifier VKs to left/right variants.
+        // Windows typically reports VK_CONTROL/VK_MENU/VK_SHIFT in wParam for both sides.
+        // For binding UI (hotkeys/rebinds), we want deterministic L/R codes.
+        const bool isExtended = (keyLParam & (1LL << 24)) != 0;
+        const UINT scanOnly = static_cast<UINT>((keyLParam >> 16) & 0xFF);
+        if (resolvedVk == VK_SHIFT) {
+            DWORD lr = static_cast<DWORD>(::MapVirtualKeyW(scanOnly, MAPVK_VSC_TO_VK_EX));
+            if (lr != 0) { resolvedVk = lr; }
+        } else if (resolvedVk == VK_CONTROL) {
+            resolvedVk = isExtended ? VK_RCONTROL : VK_LCONTROL;
+        } else if (resolvedVk == VK_MENU) {
+            resolvedVk = isExtended ? VK_RMENU : VK_LMENU;
+        }
+
         // Ensure dedicated navigation keys keep their non-numpad VK when extended bit is present.
         if ((keyLParam & (1LL << 24)) != 0) {
             switch (scanCodeWithFlags & 0xFF) {

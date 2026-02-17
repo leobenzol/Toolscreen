@@ -3518,8 +3518,8 @@ static void RenderThreadFunc(void* gameGLContext) {
                         float maxFontByWidth = pixelWidthOnScreen * 0.85f; // leave some horizontal padding
                         float maxFontByHeight = boxHeight * 0.80f;          // leave some vertical padding
                         float fontSize = requestedFontSize;
-                        if (maxFontByWidth > 0.0f) fontSize = std::min(fontSize, maxFontByWidth);
-                        if (maxFontByHeight > 0.0f) fontSize = std::min(fontSize, maxFontByHeight);
+                        if (maxFontByWidth > 0.0f) fontSize = (std::min)(fontSize, maxFontByWidth);
+                        if (maxFontByHeight > 0.0f) fontSize = (std::min)(fontSize, maxFontByHeight);
                         if (fontSize < 6.0f) fontSize = 6.0f;
                         // Combine textColorOpacity with the fade opacity
                         float finalTextAlpha = zoomConfig.textColorOpacity * request.eyeZoomFadeOpacity;
@@ -3545,7 +3545,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                             float maxTextWidth = pixelWidthOnScreen * 0.90f;
                             if (maxTextWidth > 0.0f && textSize.x > maxTextWidth && textSize.x > 0.0f) {
                                 float scale = maxTextWidth / textSize.x;
-                                finalFontSize = std::max(6.0f, finalFontSize * scale);
+                                finalFontSize = (std::max)(6.0f, finalFontSize * scale);
                                 textSize = font->CalcTextSizeA(finalFontSize, FLT_MAX, 0.0f, text.c_str());
                             }
                             float numberCenterX = boxLeft + pixelWidthOnScreen / 2.0f;

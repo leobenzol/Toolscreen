@@ -553,7 +553,9 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
         if (vkCode == 0) vkCode = rawVkCode;
     }
 
-    if (!IsResolutionChangeSupported(g_gameVersion)) { return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) }; }
+    // Even if resolution-change features are unsupported, we must not short-circuit the input pipeline.
+    // Key rebinding, mouse coordinate translation, overlays, etc. may still rely on downstream handlers.
+    if (!IsResolutionChangeSupported(g_gameVersion)) { return { false, 0 }; }
 
     // Lock-free check of hotkey main keys - acceptable to race (worst case: miss one keypress)
     // Check both raw and normalized VK so Shift/Ctrl/Alt variants and generic VKs are handled.
@@ -564,7 +566,10 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             // Any key press (that's not a hotkey) invalidates ALL pending trigger-on-release hotkeys
             for (const auto& pendingHotkeyId : g_triggerOnReleasePending) { g_triggerOnReleaseInvalidated.insert(pendingHotkeyId); }
         }
-        return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) };
+        // IMPORTANT: Do not return "consumed" here.
+        // We intentionally skip scanning hotkeys for non-main keys, but we still want later phases
+        // (mouse coordinate translation, key rebinding, etc.) to run and the message to be forwarded once.
+        return { false, 0 };
     }
 
     // Use config snapshot for thread-safe hotkey iteration
