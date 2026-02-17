@@ -2244,6 +2244,33 @@
         if (ImGui::Button("Confirm Reset", ImVec2(120, 0))) {
             g_config.modes = GetDefaultModes();
             g_config.eyezoom = GetDefaultEyeZoomConfig();
+
+            // After resetting, apply dynamic sizing so percentage/expression defaults behave correctly.
+            // (Example: Wide mode uses height = 0.25, which must be converted to pixels.)
+            int screenW = GetCachedScreenWidth();
+            int screenH = GetCachedScreenHeight();
+            if (screenW < 1) screenW = 1;
+            if (screenH < 1) screenH = 1;
+
+            for (auto& mode : g_config.modes) {
+                bool widthIsRelative = mode.widthExpr.empty() && mode.relativeWidth >= 0.0f && mode.relativeWidth <= 1.0f;
+                bool heightIsRelative = mode.heightExpr.empty() && mode.relativeHeight >= 0.0f && mode.relativeHeight <= 1.0f;
+
+                if (widthIsRelative) {
+                    int w = static_cast<int>(mode.relativeWidth * screenW);
+                    if (w < 1) w = 1;
+                    mode.width = w;
+                }
+                if (heightIsRelative) {
+                    int h = static_cast<int>(mode.relativeHeight * screenH);
+                    if (h < 1) h = 1;
+                    mode.height = h;
+                }
+            }
+
+            // Evaluate expression-based dimensions (uses cached screen size).
+            RecalculateExpressionDimensions();
+
             g_configIsDirty = true;
             ImGui::CloseCurrentPopup();
         }
