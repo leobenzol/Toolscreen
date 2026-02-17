@@ -155,6 +155,50 @@ static ImFont* g_eyeZoomTextFont = nullptr;
 static std::string g_eyeZoomFontPathCached = "";
 static float g_eyeZoomScaleFactor = 1.0f;
 
+// Font loading can fail or behave inconsistently with some font files.
+// We treat any font that can't be built reliably as invalid and fall back to Arial.
+static bool RT_IsFontStable(const std::string& fontPath, float sizePixels) {
+    if (fontPath.empty()) return false;
+
+    // Build in a temporary atlas so a broken font doesn't poison the real atlas.
+    ImFontAtlas testAtlas;
+    ImFont* testFont = testAtlas.AddFontFromFileTTF(fontPath.c_str(), sizePixels);
+    if (!testFont) return false;
+    return testAtlas.Build();
+}
+
+static ImFont* RT_AddFontWithArialFallback(ImFontAtlas* atlas, const std::string& requestedPath, float sizePixels, const char* what,
+                                          std::string* outUsedPath = nullptr) {
+    if (!atlas) return nullptr;
+
+    auto setUsed = [&](const std::string& p) {
+        if (outUsedPath) { *outUsedPath = p; }
+    };
+
+    // 1) Requested font (if stable)
+    if (!requestedPath.empty() && RT_IsFontStable(requestedPath, sizePixels)) {
+        if (ImFont* f = atlas->AddFontFromFileTTF(requestedPath.c_str(), sizePixels)) {
+            setUsed(requestedPath);
+            return f;
+        }
+    }
+
+    // 2) Arial fallback (if stable)
+    const std::string& arial = ConfigDefaults::CONFIG_FONT_PATH;
+    if (RT_IsFontStable(arial, sizePixels)) {
+        Log(std::string("Render Thread: Falling back to Arial for ") + what);
+        if (ImFont* f = atlas->AddFontFromFileTTF(arial.c_str(), sizePixels)) {
+            setUsed(arial);
+            return f;
+        }
+    }
+
+    // 3) ImGui built-in default as last resort
+    Log(std::string("Render Thread: Failed to load ") + what + ", using ImGui default font");
+    setUsed(std::string());
+    return atlas->AddFontDefault();
+}
+
 static bool RT_TryInitializeImGui(HWND hwnd, const Config& cfg) {
     if (g_renderThreadImGuiInitialized) { return true; }
     if (!hwnd) { return false; }
@@ -182,26 +226,17 @@ static bool RT_TryInitializeImGui(HWND hwnd, const Config& cfg) {
     if (scaleFactor < 1.0f) { scaleFactor = 1.0f; }
     g_eyeZoomScaleFactor = scaleFactor;
 
-    // Load base font (fall back to default if missing)
-    if (!cfg.fontPath.empty()) {
-        ImFont* baseFont = io.Fonts->AddFontFromFileTTF(cfg.fontPath.c_str(), 16.0f * scaleFactor);
-        if (!baseFont) {
-            Log("Render Thread: Failed to load base font from " + cfg.fontPath + ", using default");
-            io.Fonts->AddFontDefault();
-        }
-    } else {
-        io.Fonts->AddFontDefault();
+    // Load base font (fall back to Arial, then ImGui default)
+    {
+        const std::string requestedBase = cfg.fontPath;
+        (void)RT_AddFontWithArialFallback(io.Fonts, requestedBase, 16.0f * scaleFactor, "base font");
     }
 
     // Load EyeZoom text font (uses custom path if set, otherwise global font)
-    std::string eyeZoomFontPath = cfg.eyezoom.textFontPath.empty() ? cfg.fontPath : cfg.eyezoom.textFontPath;
-    if (!eyeZoomFontPath.empty()) {
-        g_eyeZoomTextFont = io.Fonts->AddFontFromFileTTF(eyeZoomFontPath.c_str(), 80.0f * scaleFactor);
-        g_eyeZoomFontPathCached = eyeZoomFontPath;
-    }
-    if (!g_eyeZoomTextFont) {
-        Log("Render Thread: Failed to load EyeZoom font, using default");
-        g_eyeZoomTextFont = io.Fonts->AddFontDefault();
+    {
+        std::string eyeZoomFontPath = cfg.eyezoom.textFontPath.empty() ? cfg.fontPath : cfg.eyezoom.textFontPath;
+        g_eyeZoomTextFont = RT_AddFontWithArialFallback(io.Fonts, eyeZoomFontPath, 80.0f * scaleFactor, "EyeZoom font", &g_eyeZoomFontPathCached);
+        if (g_eyeZoomFontPathCached.empty()) { g_eyeZoomFontPathCached = ConfigDefaults::CONFIG_FONT_PATH; }
     }
 
     ImGui::StyleColorsDark();
@@ -2791,17 +2826,14 @@ static void RenderThreadFunc(void* gameGLContext) {
                 }
                 const Config& fontCfgRef = *fontCfg;
                 std::string fontPath = fontCfgRef.fontPath;
-                io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 16.0f * scaleFactor);
+                // Ensure we always end up with a usable base font.
+                (void)RT_AddFontWithArialFallback(io.Fonts, fontPath, 16.0f * scaleFactor, "base font");
 
                 // Load EyeZoom text font (uses custom path if set, otherwise global font)
                 std::string eyeZoomFontPath =
                     fontCfgRef.eyezoom.textFontPath.empty() ? fontCfgRef.fontPath : fontCfgRef.eyezoom.textFontPath;
-                g_eyeZoomTextFont = io.Fonts->AddFontFromFileTTF(eyeZoomFontPath.c_str(), 80.0f * scaleFactor);
-                g_eyeZoomFontPathCached = eyeZoomFontPath;
-                if (!g_eyeZoomTextFont) {
-                    Log("Render Thread: Failed to load EyeZoom font from " + eyeZoomFontPath + ", using default");
-                    g_eyeZoomTextFont = io.Fonts->AddFontDefault();
-                }
+                g_eyeZoomTextFont = RT_AddFontWithArialFallback(io.Fonts, eyeZoomFontPath, 80.0f * scaleFactor, "EyeZoom font", &g_eyeZoomFontPathCached);
+                if (g_eyeZoomFontPathCached.empty()) { g_eyeZoomFontPathCached = ConfigDefaults::CONFIG_FONT_PATH; }
 
                 ImGui::StyleColorsDark();
                 LoadTheme();             // Load theme from theme.toml
@@ -3356,18 +3388,38 @@ static void RenderThreadFunc(void* gameGLContext) {
                         Log("Render Thread: Reloading EyeZoom font from " + newFontPath);
                         ImGuiIO& io = ImGui::GetIO();
 
-                        // Add the new font to the atlas
-                        ImFont* newFont = io.Fonts->AddFontFromFileTTF(newFontPath.c_str(), 80.0f * g_eyeZoomScaleFactor);
-                        if (newFont) {
-                            g_eyeZoomTextFont = newFont;
-                            g_eyeZoomFontPathCached = newFontPath;
+                        // Rebuild the atlas from scratch to avoid unbounded growth and stale pointers.
+                        // If the requested font is unstable, we ignore it and fall back to Arial.
+                        io.Fonts->Clear();
 
-                            // Rebuild font atlas - new ImGui handles texture upload automatically
-                            io.Fonts->Build();
-                            Log("Render Thread: EyeZoom font reloaded successfully");
-                        } else {
-                            Log("Render Thread: Failed to load EyeZoom font from " + newFontPath);
+                        // Base font
+                        (void)RT_AddFontWithArialFallback(io.Fonts, cfg.fontPath, 16.0f * g_eyeZoomScaleFactor, "base font");
+
+                        // EyeZoom font
+                        g_eyeZoomTextFont = RT_AddFontWithArialFallback(io.Fonts, newFontPath, 80.0f * g_eyeZoomScaleFactor, "EyeZoom font",
+                                                                        &g_eyeZoomFontPathCached);
+                        if (g_eyeZoomFontPathCached.empty()) { g_eyeZoomFontPathCached = ConfigDefaults::CONFIG_FONT_PATH; }
+
+                        // Overlay text label font
+                        InitializeOverlayTextFont(cfg.fontPath.empty() ? ConfigDefaults::CONFIG_FONT_PATH : cfg.fontPath, 16.0f, g_eyeZoomScaleFactor);
+
+                        // Rebuild + upload a new font texture (required when modifying fonts at runtime).
+                        if (!io.Fonts->Build()) {
+                            Log("Render Thread: Font atlas build failed after reload; forcing Arial fallback");
+                            io.Fonts->Clear();
+                            (void)RT_AddFontWithArialFallback(io.Fonts, ConfigDefaults::CONFIG_FONT_PATH, 16.0f * g_eyeZoomScaleFactor,
+                                                             "base font (forced Arial)");
+                            g_eyeZoomTextFont = RT_AddFontWithArialFallback(io.Fonts, ConfigDefaults::CONFIG_FONT_PATH,
+                                                                            80.0f * g_eyeZoomScaleFactor, "EyeZoom font (forced Arial)");
+                            InitializeOverlayTextFont(ConfigDefaults::CONFIG_FONT_PATH, 16.0f, g_eyeZoomScaleFactor);
+                            (void)io.Fonts->Build();
                         }
+
+                        // Ensure OpenGL font texture matches the rebuilt atlas.
+                        ImGui_ImplOpenGL3_DestroyFontsTexture();
+                        ImGui_ImplOpenGL3_CreateFontsTexture();
+
+                        Log("Render Thread: Fonts reloaded successfully");
                     }
                 }
 

@@ -2664,7 +2664,29 @@ void InitializeImGuiContext(HWND hwnd) {
         if (scaleFactor < 1.0f) { scaleFactor = 1.0f; }
 
         std::string fontPath = g_config.fontPath;
-        io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 16.0f * scaleFactor);
+        const float baseFontSize = 16.0f * scaleFactor;
+
+        // Some font files (or paths) can cause ImGui font loading/build to fail.
+        // If that happens, ignore the custom font and fall back to Arial.
+        auto isStable = [](const std::string& p, float sz) -> bool {
+            if (p.empty()) return false;
+            ImFontAtlas testAtlas;
+            ImFont* f = testAtlas.AddFontFromFileTTF(p.c_str(), sz);
+            if (!f) return false;
+            return testAtlas.Build();
+        };
+
+        std::string usePath = fontPath.empty() ? ConfigDefaults::CONFIG_FONT_PATH : fontPath;
+        if (!isStable(usePath, baseFontSize)) { usePath = ConfigDefaults::CONFIG_FONT_PATH; }
+
+        ImFont* baseFont = io.Fonts->AddFontFromFileTTF(usePath.c_str(), baseFontSize);
+        if (!baseFont && usePath != ConfigDefaults::CONFIG_FONT_PATH) {
+            baseFont = io.Fonts->AddFontFromFileTTF(ConfigDefaults::CONFIG_FONT_PATH.c_str(), baseFontSize);
+        }
+        if (!baseFont) {
+            Log("GUI: Failed to load configured font, using ImGui default font");
+            io.Fonts->AddFontDefault();
+        }
 
         ImGui::StyleColorsDark();
         LoadTheme();             // Load theme from theme.toml
@@ -2675,7 +2697,7 @@ void InitializeImGuiContext(HWND hwnd) {
         ImGui_ImplOpenGL3_Init("#version 330");
 
         // Initialize larger font for overlay text labels
-        InitializeOverlayTextFont(fontPath, 16.0f, scaleFactor);
+        InitializeOverlayTextFont(usePath, 16.0f, scaleFactor);
     }
 }
 
@@ -3108,7 +3130,27 @@ void HandleConfigLoadFailed(HDC hDc, BOOL (*oWglSwapBuffers)(HDC)) {
         if (scaleFactor < 1.0f) { scaleFactor = 1.0f; }
 
         std::string fontPath = g_config.fontPath;
-        io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 16.0f * scaleFactor);
+        const float baseFontSize = 16.0f * scaleFactor;
+
+        auto isStable = [](const std::string& p, float sz) -> bool {
+            if (p.empty()) return false;
+            ImFontAtlas testAtlas;
+            ImFont* f = testAtlas.AddFontFromFileTTF(p.c_str(), sz);
+            if (!f) return false;
+            return testAtlas.Build();
+        };
+
+        std::string usePath = fontPath.empty() ? ConfigDefaults::CONFIG_FONT_PATH : fontPath;
+        if (!isStable(usePath, baseFontSize)) { usePath = ConfigDefaults::CONFIG_FONT_PATH; }
+
+        ImFont* baseFont = io.Fonts->AddFontFromFileTTF(usePath.c_str(), baseFontSize);
+        if (!baseFont && usePath != ConfigDefaults::CONFIG_FONT_PATH) {
+            baseFont = io.Fonts->AddFontFromFileTTF(ConfigDefaults::CONFIG_FONT_PATH.c_str(), baseFontSize);
+        }
+        if (!baseFont) {
+            Log("GUI: Failed to load configured font, using ImGui default font");
+            io.Fonts->AddFontDefault();
+        }
 
         ImGui::StyleColorsDark();
         LoadTheme();             // Load theme from theme.toml
@@ -3119,7 +3161,7 @@ void HandleConfigLoadFailed(HDC hDc, BOOL (*oWglSwapBuffers)(HDC)) {
         ImGui_ImplOpenGL3_Init("#version 330");
 
         // Initialize larger font for overlay text labels
-        InitializeOverlayTextFont(fontPath, 16.0f, scaleFactor);
+        InitializeOverlayTextFont(usePath, 16.0f, scaleFactor);
     }
 
     ImGui_ImplOpenGL3_NewFrame();

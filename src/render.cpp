@@ -3180,11 +3180,34 @@ void InitializeOverlayTextFont(const std::string& fontPath, float baseFontSize, 
     if (!ImGui::GetCurrentContext()) return;
 
     ImGuiIO& io = ImGui::GetIO();
-    // Add a larger font (1.5x the base size) for overlay text labels
-    g_overlayTextFont = io.Fonts->AddFontFromFileTTF(fontPath.c_str(), baseFontSize * 1.5f * scaleFactor);
+    const float sizePixels = baseFontSize * 1.5f * scaleFactor;
+
+    // Add a larger font (1.5x the base size) for overlay text labels.
+    // If the configured font can't be loaded reliably, fall back to Arial.
+    std::string usePath = fontPath.empty() ? ConfigDefaults::CONFIG_FONT_PATH : fontPath;
+
+    // Validate stability in a temporary atlas to avoid poisoning the live atlas.
+    auto isStable = [](const std::string& p, float sz) -> bool {
+        if (p.empty()) return false;
+        ImFontAtlas testAtlas;
+        ImFont* f = testAtlas.AddFontFromFileTTF(p.c_str(), sz);
+        if (!f) return false;
+        return testAtlas.Build();
+    };
+
+    if (!isStable(usePath, sizePixels)) { usePath = ConfigDefaults::CONFIG_FONT_PATH; }
+
+    g_overlayTextFont = io.Fonts->AddFontFromFileTTF(usePath.c_str(), sizePixels);
+    if (!g_overlayTextFont && usePath != ConfigDefaults::CONFIG_FONT_PATH) {
+        g_overlayTextFont = io.Fonts->AddFontFromFileTTF(ConfigDefaults::CONFIG_FONT_PATH.c_str(), sizePixels);
+    }
+    if (!g_overlayTextFont) {
+        // Last resort: ensure overlay text still has a usable font.
+        g_overlayTextFont = io.Fonts->AddFontDefault();
+    }
 
     // Rebuild font atlas to apply changes
-    io.Fonts->Build();
+    (void)io.Fonts->Build();
 }
 
 // Update overlay text font size dynamically
