@@ -1,6 +1,7 @@
 #include "config_toml.h"
 #include "config_defaults.h"
 #include "gui.h"
+#include "logic_thread.h"
 #include "utils.h"
 
 #include <cmath>
@@ -239,8 +240,6 @@ void MirrorRenderConfigFromToml(const toml::table& tbl, MirrorRenderConfig& cfg)
     cfg.relativeX = GetOr(tbl, "relativeX", 0.5f);
     cfg.relativeY = GetOr(tbl, "relativeY", 0.5f);
 
-    // Read x/y - check if they're floats (0-1) or integers
-    // If the value is a float between 0 and 1, treat as percentage
     auto xNode = tbl["x"];
     auto yNode = tbl["y"];
 
@@ -249,7 +248,10 @@ void MirrorRenderConfigFromToml(const toml::table& tbl, MirrorRenderConfig& cfg)
 
     if (xNode.is_floating_point()) {
         double xVal = xNode.as_floating_point()->get();
-        if (xVal >= 0.0 && xVal <= 1.0) {
+        if (cfg.useRelativePosition) {
+            cfg.relativeX = static_cast<float>(xVal);
+            xIsPercentage = true;
+        } else if (xVal >= 0.0 && xVal <= 1.0) {
             cfg.relativeX = static_cast<float>(xVal);
             xIsPercentage = true;
         } else {
@@ -263,7 +265,10 @@ void MirrorRenderConfigFromToml(const toml::table& tbl, MirrorRenderConfig& cfg)
 
     if (yNode.is_floating_point()) {
         double yVal = yNode.as_floating_point()->get();
-        if (yVal >= 0.0 && yVal <= 1.0) {
+        if (cfg.useRelativePosition) {
+            cfg.relativeY = static_cast<float>(yVal);
+            yIsPercentage = true;
+        } else if (yVal >= 0.0 && yVal <= 1.0) {
             cfg.relativeY = static_cast<float>(yVal);
             yIsPercentage = true;
         } else {
@@ -277,6 +282,18 @@ void MirrorRenderConfigFromToml(const toml::table& tbl, MirrorRenderConfig& cfg)
 
     // Auto-detect relative mode if both x and y were percentages
     if (!tbl.contains("useRelativePosition") && xIsPercentage && yIsPercentage) { cfg.useRelativePosition = true; }
+
+    if (cfg.useRelativePosition) {
+        int screenW = GetCachedScreenWidth();
+        int screenH = GetCachedScreenHeight();
+
+        if (screenW > 0 && (tbl.contains("relativeX") || xIsPercentage)) {
+            cfg.x = static_cast<int>(cfg.relativeX * static_cast<float>(screenW));
+        }
+        if (screenH > 0 && (tbl.contains("relativeY") || yIsPercentage)) {
+            cfg.y = static_cast<int>(cfg.relativeY * static_cast<float>(screenH));
+        }
+    }
 
     cfg.scale = GetOr(tbl, "scale", ConfigDefaults::MIRROR_RENDER_SCALE);
     cfg.separateScale = GetOr(tbl, "separateScale", ConfigDefaults::MIRROR_RENDER_SEPARATE_SCALE);
