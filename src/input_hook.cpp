@@ -257,10 +257,48 @@ InputHandlerResult HandleImGuiInput(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("HandleGuiToggle");
 
-    if (uMsg != WM_KEYDOWN || (!IsGuiHotkeyPressed(wParam) && wParam != VK_ESCAPE)) { return { false, 0 }; }
+    DWORD vkCode = 0;
+    bool isEscape = false;
+    switch (uMsg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        vkCode = static_cast<DWORD>(wParam);
+        isEscape = (wParam == VK_ESCAPE);
+
+        // Normalize generic modifier VKs to left/right variants.
+        if (vkCode == VK_SHIFT) {
+            DWORD mapped = static_cast<DWORD>(::MapVirtualKeyW((UINT)((lParam >> 16) & 0xff), MAPVK_VSC_TO_VK_EX));
+            if (mapped != 0) vkCode = mapped;
+        } else if (vkCode == VK_CONTROL) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RCONTROL : VK_LCONTROL;
+        } else if (vkCode == VK_MENU) {
+            vkCode = (HIWORD(lParam) & KF_EXTENDED) ? VK_RMENU : VK_LMENU;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+        vkCode = VK_LBUTTON;
+        break;
+    case WM_RBUTTONDOWN:
+        vkCode = VK_RBUTTON;
+        break;
+    case WM_MBUTTONDOWN:
+        vkCode = VK_MBUTTON;
+        break;
+    case WM_XBUTTONDOWN: {
+        WORD xButton = GET_XBUTTON_WPARAM(wParam);
+        vkCode = (xButton == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        break;
+    }
+    default:
+        return { false, 0 };
+    }
+
+    // Escape always toggles GUI (with additional guards below). Otherwise, require the configured GUI hotkey.
+    if (!isEscape && !CheckHotkeyMatch(g_config.guiHotkey, vkCode)) { return { false, 0 }; }
 
     bool allow_toggle = true;
-    if (wParam == VK_ESCAPE && !g_showGui.load()) { allow_toggle = false; }
+    if (isEscape && !g_showGui.load()) { allow_toggle = false; }
 
     if (!allow_toggle) { return { false, 0 }; }
 
@@ -280,11 +318,9 @@ InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
 
     bool is_closing = g_showGui.load();
 
-    // Don't close the GUI if ImGui has an active item (e.g. editing a text box).
-    // This flag is published by the render thread.
-    if (wParam == VK_ESCAPE && g_imguiAnyItemActive.load(std::memory_order_acquire)) { is_closing = false; }
-    if (wParam == VK_ESCAPE && IsHotkeyBindingActive()) { is_closing = false; }
-    if (wParam == VK_ESCAPE && IsRebindBindingActive()) { is_closing = false; }
+    if (isEscape && g_imguiAnyItemActive.load(std::memory_order_acquire)) { is_closing = false; }
+    if (isEscape && IsHotkeyBindingActive()) { is_closing = false; }
+    if (isEscape && IsRebindBindingActive()) { is_closing = false; }
 
     if (is_closing) {
         g_showGui = false;
@@ -331,7 +367,7 @@ InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         s_hoveredWindowOverlayName = "";
         s_draggedWindowOverlayName = "";
         s_isWindowOverlayDragging = false;
-    } else if (wParam != VK_ESCAPE) {
+    } else if (!isEscape) {
         g_showGui = true;
         const bool wasCursorVisible = IsCursorVisible();
         g_wasCursorVisible = wasCursorVisible;
@@ -1106,7 +1142,37 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
             if (outputVK == VK_LBUTTON || outputVK == VK_RBUTTON || outputVK == VK_MBUTTON || outputVK == VK_XBUTTON1 ||
                 outputVK == VK_XBUTTON2) {
                 UINT newMsg = 0;
-                WPARAM newWParam = wParam;
+                auto buildMouseKeyState = [&](DWORD buttonVk, bool buttonDown) -> WORD {
+                    WORD mk = 0;
+                    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) mk |= MK_CONTROL;
+                    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) mk |= MK_SHIFT;
+
+                    auto setBtn = [&](int vk, WORD mask, bool isThisButton) {
+                        bool down = (GetKeyState(vk) & 0x8000) != 0;
+                        if (isThisButton) down = buttonDown;
+                        if (down) mk |= mask;
+                    };
+
+                    setBtn(VK_LBUTTON, MK_LBUTTON, buttonVk == VK_LBUTTON);
+                    setBtn(VK_RBUTTON, MK_RBUTTON, buttonVk == VK_RBUTTON);
+                    setBtn(VK_MBUTTON, MK_MBUTTON, buttonVk == VK_MBUTTON);
+                    setBtn(VK_XBUTTON1, MK_XBUTTON1, buttonVk == VK_XBUTTON1);
+                    setBtn(VK_XBUTTON2, MK_XBUTTON2, buttonVk == VK_XBUTTON2);
+                    return mk;
+                };
+
+                LPARAM mouseLParam = lParam;
+                if (!isMouseButton) {
+                    POINT pt{};
+                    if (GetCursorPos(&pt) && ScreenToClient(hWnd, &pt)) {
+                        mouseLParam = MAKELPARAM(pt.x, pt.y);
+                    } else {
+                        mouseLParam = MAKELPARAM(0, 0);
+                    }
+                }
+
+                WORD mkState = buildMouseKeyState(outputVK, isKeyDown);
+                WPARAM newWParam = mkState;
 
                 if (outputVK == VK_LBUTTON) {
                     newMsg = isKeyDown ? WM_LBUTTONDOWN : WM_LBUTTONUP;
@@ -1116,13 +1182,13 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
                     newMsg = isKeyDown ? WM_MBUTTONDOWN : WM_MBUTTONUP;
                 } else if (outputVK == VK_XBUTTON1) {
                     newMsg = isKeyDown ? WM_XBUTTONDOWN : WM_XBUTTONUP;
-                    newWParam = MAKEWPARAM(LOWORD(wParam), XBUTTON1);
+                    newWParam = MAKEWPARAM(mkState, XBUTTON1);
                 } else if (outputVK == VK_XBUTTON2) {
                     newMsg = isKeyDown ? WM_XBUTTONDOWN : WM_XBUTTONUP;
-                    newWParam = MAKEWPARAM(LOWORD(wParam), XBUTTON2);
+                    newWParam = MAKEWPARAM(mkState, XBUTTON2);
                 }
 
-                return { true, CallWindowProc(g_originalWndProc, hWnd, newMsg, newWParam, lParam) };
+                return { true, CallWindowProc(g_originalWndProc, hWnd, newMsg, newWParam, mouseLParam) };
             }
 
             // For keyboard output from keyboard/mouse input

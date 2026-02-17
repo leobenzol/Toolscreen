@@ -2471,13 +2471,20 @@ void RenderSettingsGUI() {
         // Build list of currently pressed keys (excluding pre-held keys)
         std::vector<DWORD> currentlyPressed;
 
-        // Check modifier keys first (in order: Ctrl, Shift, Alt)
-        if ((GetAsyncKeyState(VK_LCONTROL) & 0x8000) && !s_preHeldKeys.count(VK_LCONTROL)) currentlyPressed.push_back(VK_LCONTROL);
-        if ((GetAsyncKeyState(VK_RCONTROL) & 0x8000) && !s_preHeldKeys.count(VK_RCONTROL)) currentlyPressed.push_back(VK_RCONTROL);
-        if ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) && !s_preHeldKeys.count(VK_LSHIFT)) currentlyPressed.push_back(VK_LSHIFT);
-        if ((GetAsyncKeyState(VK_RSHIFT) & 0x8000) && !s_preHeldKeys.count(VK_RSHIFT)) currentlyPressed.push_back(VK_RSHIFT);
-        if ((GetAsyncKeyState(VK_LMENU) & 0x8000) && !s_preHeldKeys.count(VK_LMENU)) currentlyPressed.push_back(VK_LMENU);
-        if ((GetAsyncKeyState(VK_RMENU) & 0x8000) && !s_preHeldKeys.count(VK_RMENU)) currentlyPressed.push_back(VK_RMENU);
+        const bool lctrlDown = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0;
+        const bool rctrlDown = (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+        const bool lshiftDown = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+        const bool rshiftDown = (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+        const bool laltDown = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+        const bool raltDown = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+
+        const bool ctrlPreHeld = s_preHeldKeys.count(VK_LCONTROL) || s_preHeldKeys.count(VK_RCONTROL) || s_preHeldKeys.count(VK_CONTROL);
+        const bool shiftPreHeld = s_preHeldKeys.count(VK_LSHIFT) || s_preHeldKeys.count(VK_RSHIFT) || s_preHeldKeys.count(VK_SHIFT);
+        const bool altPreHeld = s_preHeldKeys.count(VK_LMENU) || s_preHeldKeys.count(VK_RMENU) || s_preHeldKeys.count(VK_MENU);
+
+        if ((lctrlDown || rctrlDown) && !ctrlPreHeld) currentlyPressed.push_back(VK_CONTROL);
+        if ((lshiftDown || rshiftDown) && !shiftPreHeld) currentlyPressed.push_back(VK_SHIFT);
+        if ((laltDown || raltDown) && !altPreHeld) currentlyPressed.push_back(VK_MENU);
 
         // Check all other keys
         for (int vk = 1; vk < 0xFF; ++vk) {
@@ -2496,14 +2503,14 @@ void RenderSettingsGUI() {
             if (std::find(s_bindingKeys.begin(), s_bindingKeys.end(), key) == s_bindingKeys.end()) {
                 // New key - add it in the right position
                 // Modifiers should be at the front, main key at the end
-                bool isModifier = (key == VK_LCONTROL || key == VK_RCONTROL || key == VK_LSHIFT || key == VK_RSHIFT || key == VK_LMENU ||
-                                   key == VK_RMENU);
+                bool isModifier = (key == VK_CONTROL || key == VK_SHIFT || key == VK_MENU || key == VK_LCONTROL || key == VK_RCONTROL ||
+                                   key == VK_LSHIFT || key == VK_RSHIFT || key == VK_LMENU || key == VK_RMENU);
                 if (isModifier) {
                     // Insert modifiers before non-modifiers
                     auto insertPos = s_bindingKeys.begin();
                     for (auto it = s_bindingKeys.begin(); it != s_bindingKeys.end(); ++it) {
-                        bool itIsModifier = (*it == VK_LCONTROL || *it == VK_RCONTROL || *it == VK_LSHIFT || *it == VK_RSHIFT ||
-                                             *it == VK_LMENU || *it == VK_RMENU);
+                        bool itIsModifier = (*it == VK_CONTROL || *it == VK_SHIFT || *it == VK_MENU || *it == VK_LCONTROL || *it == VK_RCONTROL ||
+                                             *it == VK_LSHIFT || *it == VK_RSHIFT || *it == VK_LMENU || *it == VK_RMENU);
                         if (!itIsModifier) {
                             insertPos = it;
                             break;
