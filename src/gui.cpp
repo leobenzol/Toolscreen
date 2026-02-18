@@ -2311,17 +2311,41 @@ static int s_mainHotkeyToBind = -1;
 static int s_sensHotkeyToBind = -1; // Sensitivity hotkey binding state
 static ExclusionBindState s_exclusionToBind = { -1, -1 };
 static AltBindState s_altHotkeyToBind = { -1, -1 };
-static std::atomic<bool> s_isRebindBindingActive{ false };
+// Binding-active flags are read from the window thread (WndProc) to decide whether Escape should close the GUI.
+// The binding UI state variables above are mutated on the render thread; reading them cross-thread would be a data race.
+//
+// Instead, we expose thread-safe "binding active" signals as timestamps refreshed by the render thread while the binding UI
+// is present. The window thread treats binding as active for a short grace window after the last refresh.
+static constexpr uint64_t kBindingActiveGraceMs = 250;
+static std::atomic<uint64_t> s_lastHotkeyBindingMarkMs{ 0 };
+static std::atomic<uint64_t> s_lastRebindBindingMarkMs{ 0 };
 
-bool IsHotkeyBindingActive() {
+static inline uint64_t NowMs_TickCount64() { return static_cast<uint64_t>(::GetTickCount64()); }
+
+static bool IsHotkeyBindingActive_UiState() {
     return s_mainHotkeyToBind != -1 || s_sensHotkeyToBind != -1 || s_exclusionToBind.hotkey_idx != -1 || s_altHotkeyToBind.hotkey_idx != -1;
 }
 
-bool IsRebindBindingActive() { return s_isRebindBindingActive.load(std::memory_order_relaxed); }
+bool IsHotkeyBindingActive() {
+    const uint64_t last = s_lastHotkeyBindingMarkMs.load(std::memory_order_acquire);
+    if (last == 0) return false;
+    return (NowMs_TickCount64() - last) <= kBindingActiveGraceMs;
+}
 
-void ResetTransientBindingUiState() { s_isRebindBindingActive.store(false, std::memory_order_relaxed); }
+bool IsRebindBindingActive() {
+    const uint64_t last = s_lastRebindBindingMarkMs.load(std::memory_order_acquire);
+    if (last == 0) return false;
+    return (NowMs_TickCount64() - last) <= kBindingActiveGraceMs;
+}
 
-void MarkRebindBindingActive() { s_isRebindBindingActive.store(true, std::memory_order_relaxed); }
+void ResetTransientBindingUiState() {
+    // Intentionally a no-op.
+    // (Kept for API compatibility with existing GUI code paths.)
+}
+
+void MarkRebindBindingActive() { s_lastRebindBindingMarkMs.store(NowMs_TickCount64(), std::memory_order_release); }
+
+void MarkHotkeyBindingActive() { s_lastHotkeyBindingMarkMs.store(NowMs_TickCount64(), std::memory_order_release); }
 
 void RenderSettingsGUI() {
     PROFILE_SCOPE_CAT("Settings GUI Rendering", "ImGui");
@@ -2384,7 +2408,8 @@ void RenderSettingsGUI() {
         return gameState.c_str(); // Fallback to original name
     };
 
-    bool is_binding = IsHotkeyBindingActive();
+    bool is_binding = IsHotkeyBindingActive_UiState();
+    if (is_binding) { MarkHotkeyBindingActive(); }
 
     if (is_binding) {
         if (!s_bindingInitialized) {
@@ -2410,8 +2435,15 @@ void RenderSettingsGUI() {
         ImGui::Text("Press ESC to cancel.");
         ImGui::Separator();
 
-        // Check for escape to cancel
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+        static uint64_t s_lastBindingInputSeqHotkeyBind = 0;
+        if (ImGui::IsWindowAppearing()) { s_lastBindingInputSeqHotkeyBind = GetLatestBindingInputSequence(); }
+
+        // Check for escape to cancel (event-based, no polling)
+        DWORD capturedVkCancel = 0;
+        LPARAM capturedLParamCancel = 0;
+        bool capturedIsMouseCancel = false;
+        if (ConsumeBindingInputEventSince(s_lastBindingInputSeqHotkeyBind, capturedVkCancel, capturedLParamCancel, capturedIsMouseCancel) &&
+            capturedVkCancel == VK_ESCAPE) {
             Log("Binding cancelled from Escape key.");
             s_mainHotkeyToBind = -1;
             s_sensHotkeyToBind = -1;
@@ -2422,6 +2454,8 @@ void RenderSettingsGUI() {
             s_preHeldKeys.clear();
             s_bindingInitialized = false;
             ImGui::CloseCurrentPopup();
+            (void)capturedLParamCancel;
+            (void)capturedIsMouseCancel;
             ImGui::EndPopup();
             return;
         }

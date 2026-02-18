@@ -29,6 +29,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                 s_mainHotkeyToBind = -999; // Special ID for GUI hotkey
                 s_altHotkeyToBind = { -1, -1 };
                 s_exclusionToBind = { -1, -1 };
+                MarkHotkeyBindingActive();
             }
             ImGui::TreePop();
         }
@@ -51,6 +52,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                 s_mainHotkeyToBind = -998; // Special ID for borderless toggle hotkey
                 s_altHotkeyToBind = { -1, -1 };
                 s_exclusionToBind = { -1, -1 };
+                MarkHotkeyBindingActive();
             }
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
@@ -78,6 +80,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     s_mainHotkeyToBind = -997;
                     s_altHotkeyToBind = { -1, -1 };
                     s_exclusionToBind = { -1, -1 };
+                    MarkHotkeyBindingActive();
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("(?)");
@@ -101,6 +104,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     s_mainHotkeyToBind = -996;
                     s_altHotkeyToBind = { -1, -1 };
                     s_exclusionToBind = { -1, -1 };
+                    MarkHotkeyBindingActive();
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("(?)");
@@ -149,6 +153,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     s_mainHotkeyToBind = (int)i;
                     s_altHotkeyToBind = { -1, -1 };
                     s_exclusionToBind = { -1, -1 };
+                    MarkHotkeyBindingActive();
                 }
 
                 ImGui::SeparatorText("Target Mode");
@@ -199,6 +204,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                         s_altHotkeyToBind = { (int)i, (int)j };
                         s_mainHotkeyToBind = -1;
                         s_exclusionToBind = { -1, -1 };
+                        MarkHotkeyBindingActive();
                     }
                     ImGui::SameLine();
 
@@ -354,6 +360,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                                 s_exclusionToBind = { (int)i, (int)j };
                                 s_mainHotkeyToBind = -1;
                                 s_altHotkeyToBind = { -1, -1 };
+                                MarkHotkeyBindingActive();
                             } else {
                                 s_exclusionToBind = { -1, -1 };
                             }
@@ -480,6 +487,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     s_mainHotkeyToBind = -1;
                     s_altHotkeyToBind = { -1, -1 };
                     s_exclusionToBind = { -1, -1 };
+                    MarkHotkeyBindingActive();
                 }
                 ImGui::SameLine();
                 HelpMarker("Click to bind a key combination for this sensitivity override.");

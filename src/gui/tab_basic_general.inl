@@ -31,6 +31,7 @@ if (ImGui::BeginTabItem("General")) {
                 s_mainHotkeyToBind = hotkeyIdx;
                 s_altHotkeyToBind = { -1, -1 };
                 s_exclusionToBind = { -1, -1 };
+                MarkHotkeyBindingActive();
             }
             ImGui::PopID();
         } else {
@@ -152,6 +153,7 @@ if (ImGui::BeginTabItem("General")) {
             s_mainHotkeyToBind = hotkeyIdx;
             s_altHotkeyToBind = { -1, -1 };
             s_exclusionToBind = { -1, -1 };
+            MarkHotkeyBindingActive();
         }
         ImGui::PopStyleColor(3);
         ImGui::PopID();

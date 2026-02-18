@@ -342,28 +342,28 @@ if (ImGui::BeginTabItem("Inputs")) {
                     static uint64_t s_lastBindingInputSeqInputs1 = 0;
                     if (ImGui::IsWindowAppearing()) { s_lastBindingInputSeqInputs1 = GetLatestBindingInputSequence(); }
 
-                    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                        s_rebindFromKeyToBind = -1;
-                        ImGui::CloseCurrentPopup();
-                    }
-
                     DWORD capturedVk = 0;
                     LPARAM capturedLParam = 0;
                     bool capturedIsMouse = false;
                     if (ConsumeBindingInputEventSince(s_lastBindingInputSeqInputs1, capturedVk, capturedLParam, capturedIsMouse)) {
-                        // Allow binding modifier keys (L/R Ctrl/Shift/Alt) for key rebinding.
-                        // Only disallow Escape (cancel) and Windows keys.
-                        if (capturedVk != VK_ESCAPE && capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
-                            if (s_rebindFromKeyToBind != -1 && s_rebindFromKeyToBind < (int)g_config.keyRebinds.rebinds.size()) {
-                                g_config.keyRebinds.rebinds[s_rebindFromKeyToBind].fromKey = capturedVk;
-                                g_configIsDirty = true;
-                                std::lock_guard<std::mutex> hotkeyLock(g_hotkeyMainKeysMutex);
-                                RebuildHotkeyMainKeys_Internal();
-                                (void)capturedLParam;
-                                (void)capturedIsMouse;
-                            }
+                        if (capturedVk == VK_ESCAPE) {
                             s_rebindFromKeyToBind = -1;
                             ImGui::CloseCurrentPopup();
+                        } else {
+                            // Allow binding modifier keys (L/R Ctrl/Shift/Alt) for key rebinding.
+                            // Only disallow Windows keys.
+                            if (capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
+                                if (s_rebindFromKeyToBind != -1 && s_rebindFromKeyToBind < (int)g_config.keyRebinds.rebinds.size()) {
+                                    g_config.keyRebinds.rebinds[s_rebindFromKeyToBind].fromKey = capturedVk;
+                                    g_configIsDirty = true;
+                                    std::lock_guard<std::mutex> hotkeyLock(g_hotkeyMainKeysMutex);
+                                    RebuildHotkeyMainKeys_Internal();
+                                    (void)capturedLParam;
+                                    (void)capturedIsMouse;
+                                }
+                                s_rebindFromKeyToBind = -1;
+                                ImGui::CloseCurrentPopup();
+                            }
                         }
                     }
 
@@ -383,27 +383,27 @@ if (ImGui::BeginTabItem("Inputs")) {
                     static uint64_t s_lastBindingInputSeqInputs2 = 0;
                     if (ImGui::IsWindowAppearing()) { s_lastBindingInputSeqInputs2 = GetLatestBindingInputSequence(); }
 
-                    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                        s_rebindOutputVKToBind = -1;
-                        ImGui::CloseCurrentPopup();
-                    }
-
                     DWORD capturedVk = 0;
                     LPARAM capturedLParam = 0;
                     bool capturedIsMouse = false;
                     if (ConsumeBindingInputEventSince(s_lastBindingInputSeqInputs2, capturedVk, capturedLParam, capturedIsMouse)) {
-                        // Allow modifier keys here as well (useful when the desired output is a modifier).
-                        if (capturedVk != VK_ESCAPE && capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
-                            if (s_rebindOutputVKToBind >= 0 && s_rebindOutputVKToBind < (int)g_config.keyRebinds.rebinds.size()) {
-                                auto& rebind = g_config.keyRebinds.rebinds[s_rebindOutputVKToBind];
-                                rebind.toKey = capturedVk;
-                                if (rebind.useCustomOutput) { rebind.customOutputVK = capturedVk; }
-                                g_configIsDirty = true;
-                                (void)capturedLParam;
-                                (void)capturedIsMouse;
-                            }
+                        if (capturedVk == VK_ESCAPE) {
                             s_rebindOutputVKToBind = -1;
                             ImGui::CloseCurrentPopup();
+                        } else {
+                            // Allow modifier keys here as well (useful when the desired output is a modifier).
+                            if (capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
+                                if (s_rebindOutputVKToBind >= 0 && s_rebindOutputVKToBind < (int)g_config.keyRebinds.rebinds.size()) {
+                                    auto& rebind = g_config.keyRebinds.rebinds[s_rebindOutputVKToBind];
+                                    rebind.toKey = capturedVk;
+                                    if (rebind.useCustomOutput) { rebind.customOutputVK = capturedVk; }
+                                    g_configIsDirty = true;
+                                    (void)capturedLParam;
+                                    (void)capturedIsMouse;
+                                }
+                                s_rebindOutputVKToBind = -1;
+                                ImGui::CloseCurrentPopup();
+                            }
                         }
                     }
 
@@ -423,19 +423,18 @@ if (ImGui::BeginTabItem("Inputs")) {
                     static uint64_t s_lastBindingInputSeqInputs3 = 0;
                     if (ImGui::IsWindowAppearing()) { s_lastBindingInputSeqInputs3 = GetLatestBindingInputSequence(); }
 
-                    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                        s_rebindOutputScanToBind = -1;
-                        ImGui::CloseCurrentPopup();
-                    }
-
                     DWORD capturedVk = 0;
                     LPARAM capturedLParam = 0;
                     bool capturedIsMouse = false;
                     if (ConsumeBindingInputEventSince(s_lastBindingInputSeqInputs3, capturedVk, capturedLParam, capturedIsMouse)) {
-                        // Allow modifier keys when capturing scan codes too.
-                        if (capturedVk != VK_ESCAPE && capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
-                            if (s_rebindOutputScanToBind >= 0 && s_rebindOutputScanToBind < (int)g_config.keyRebinds.rebinds.size()) {
-                                auto& rebind = g_config.keyRebinds.rebinds[s_rebindOutputScanToBind];
+                        if (capturedVk == VK_ESCAPE) {
+                            s_rebindOutputScanToBind = -1;
+                            ImGui::CloseCurrentPopup();
+                        } else {
+                            // Allow modifier keys when capturing scan codes too.
+                            if (capturedVk != VK_LWIN && capturedVk != VK_RWIN) {
+                                if (s_rebindOutputScanToBind >= 0 && s_rebindOutputScanToBind < (int)g_config.keyRebinds.rebinds.size()) {
+                                    auto& rebind = g_config.keyRebinds.rebinds[s_rebindOutputScanToBind];
 
                                 if (capturedVk == VK_LBUTTON || capturedVk == VK_RBUTTON || capturedVk == VK_MBUTTON ||
                                     capturedVk == VK_XBUTTON1 || capturedVk == VK_XBUTTON2) {
@@ -460,11 +459,12 @@ if (ImGui::BeginTabItem("Inputs")) {
                                         " storedScan=" + std::to_string(scanCode) + " ext=" + std::string((scanCode & 0xFF00) ? "1" : "0"));
                                 }
 
-                                g_configIsDirty = true;
-                                (void)capturedIsMouse;
+                                    g_configIsDirty = true;
+                                    (void)capturedIsMouse;
+                                }
+                                s_rebindOutputScanToBind = -1;
+                                ImGui::CloseCurrentPopup();
                             }
-                            s_rebindOutputScanToBind = -1;
-                            ImGui::CloseCurrentPopup();
                         }
                     }
 
@@ -497,6 +497,7 @@ if (ImGui::BeginTabItem("Inputs")) {
                         s_rebindFromKeyToBind = (int)i;
                         s_rebindOutputVKToBind = -1;
                         s_rebindOutputScanToBind = -1;
+                        MarkRebindBindingActive();
                     }
                     if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Click to bind the key to intercept"); }
 
@@ -515,6 +516,7 @@ if (ImGui::BeginTabItem("Inputs")) {
                         s_rebindOutputVKToBind = (int)i;
                         s_rebindFromKeyToBind = -1;
                         s_rebindOutputScanToBind = -1;
+                        MarkRebindBindingActive();
                     }
                     if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Click to bind which character is typed in chat/recipe book"); }
 
@@ -551,6 +553,7 @@ if (ImGui::BeginTabItem("Inputs")) {
                         s_rebindOutputScanToBind = (int)i;
                         s_rebindFromKeyToBind = -1;
                         s_rebindOutputVKToBind = -1;
+                        MarkRebindBindingActive();
                     }
                     if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Click to bind which game keybind is triggered"); }
 

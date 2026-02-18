@@ -52,6 +52,7 @@ bool IsHotkeyBindingActive();
 bool IsRebindBindingActive();
 void ResetTransientBindingUiState();
 void MarkRebindBindingActive();
+void MarkHotkeyBindingActive();
 std::vector<DWORD> ParseHotkeyString(const std::string& hotkeyStr);
 void RegisterBindingInputEvent(UINT uMsg, WPARAM wParam, LPARAM lParam);
 uint64_t GetLatestBindingInputSequence();

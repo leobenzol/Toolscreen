@@ -19,6 +19,7 @@ if (ImGui::BeginTabItem("Other")) {
         s_mainHotkeyToBind = -999; // Special ID for GUI hotkey
         s_altHotkeyToBind = { -1, -1 };
         s_exclusionToBind = { -1, -1 };
+            MarkHotkeyBindingActive();
     }
     ImGui::PopID();
 
@@ -37,6 +38,7 @@ if (ImGui::BeginTabItem("Other")) {
             s_mainHotkeyToBind = -997;
             s_altHotkeyToBind = { -1, -1 };
             s_exclusionToBind = { -1, -1 };
+                MarkHotkeyBindingActive();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
@@ -58,6 +60,7 @@ if (ImGui::BeginTabItem("Other")) {
             s_mainHotkeyToBind = -996;
             s_altHotkeyToBind = { -1, -1 };
             s_exclusionToBind = { -1, -1 };
+                MarkHotkeyBindingActive();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
@@ -82,6 +85,7 @@ if (ImGui::BeginTabItem("Other")) {
         s_mainHotkeyToBind = -998; // Special ID for borderless toggle hotkey
         s_altHotkeyToBind = { -1, -1 };
         s_exclusionToBind = { -1, -1 };
+            MarkHotkeyBindingActive();
     }
     ImGui::SameLine();
     HelpMarker("Toggles the game window between its previous windowed size and a borderless, monitor-sized window.");
