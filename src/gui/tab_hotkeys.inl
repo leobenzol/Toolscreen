@@ -40,7 +40,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
         ImGui::PushID("borderless_hotkey");
         std::string borderlessKeyStr = GetKeyComboString(g_config.borderlessHotkey);
         std::string borderlessNodeLabel =
-            "Toggle Borderless (monitor-sized): " + (borderlessKeyStr.empty() ? "[None]" : borderlessKeyStr);
+            "Toggle Borderless: " + (borderlessKeyStr.empty() ? "[None]" : borderlessKeyStr);
 
         bool borderlessNodeOpen =
             ImGui::TreeNodeEx("##borderless_hotkey_node", ImGuiTreeNodeFlags_SpanAvailWidth, "%s", borderlessNodeLabel.c_str());
