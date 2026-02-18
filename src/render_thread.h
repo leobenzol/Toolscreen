@@ -183,6 +183,28 @@ GLuint GetCompletedRenderTexture();
 // IMPORTANT: The caller must NOT delete this fence - it's managed by the render thread
 GLsync GetCompletedRenderFence();
 
+// === Cross-context producer/consumer safety ===
+// The render thread renders into a ring of FBO textures. The main thread samples one of those
+// textures during the final composite. If the render thread laps the main thread (e.g. scheduler
+// jitter / very high FPS), it can start writing into a texture that the main thread is still
+// sampling, producing a rare 1-frame "missing overlays" flicker.
+//
+// To prevent that, the main thread can publish a GLsync fence after it finishes sampling a
+// completed texture; the render thread waits on that fence before reusing the corresponding FBO.
+struct CompletedRenderFrame {
+    GLuint texture = 0;
+    GLsync fence = nullptr; // Fence signaling render-thread completion of this texture
+    int fboIndex = -1;      // Which internal render-thread FBO owns `texture` (-1 if unknown)
+};
+
+// Returns the last completed render frame in a self-consistent way.
+// (Texture is mapped to an internal FBO index by GL name.)
+CompletedRenderFrame GetCompletedRenderFrame();
+
+// Main thread: publish a fence that signals when it has finished sampling the completed texture.
+// Render thread: waits on this before reusing that FBO as a render target.
+void SubmitRenderFBOConsumerFence(int fboIndex, GLsync consumerFence);
+
 // Get the texture from the completed OBS render
 // Returns 0 if no texture is ready
 GLuint GetCompletedObsTexture();

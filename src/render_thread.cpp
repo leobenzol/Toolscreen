@@ -48,10 +48,37 @@ static RenderFBO g_renderFBOs[RENDER_THREAD_FBO_COUNT];
 static std::atomic<int> g_writeFBOIndex{ 0 }; // FBO currently being written by render thread
 static std::atomic<int> g_readFBOIndex{ -1 }; // FBO ready for reading by main thread (-1 = none ready)
 
+// Consumer fences (main thread -> render thread):
+// One fence per FBO index, created by the main thread after it finishes sampling that FBO's texture.
+// The render thread waits on (and deletes) the fence before reusing the FBO as a render target.
+static std::atomic<GLsync> g_renderFBOConsumerFences[RENDER_THREAD_FBO_COUNT];
+
 // OBS animated frame FBOs (WITH animation, separate from user's view)
 static RenderFBO g_obsRenderFBOs[RENDER_THREAD_FBO_COUNT];
 static std::atomic<int> g_obsWriteFBOIndex{ 0 };
 static std::atomic<int> g_obsReadFBOIndex{ -1 };
+
+static std::atomic<GLsync> g_obsFBOConsumerFences[RENDER_THREAD_FBO_COUNT];
+
+static int FindFboIndexByTexture(const RenderFBO* fboArray, GLuint tex) {
+    if (tex == 0) return -1;
+    for (int i = 0; i < RENDER_THREAD_FBO_COUNT; ++i) {
+        if (fboArray[i].texture == tex) return i;
+    }
+    return -1;
+}
+
+static void RT_WaitForConsumerFence(bool isObsRequest, int writeIdx) {
+    if (writeIdx < 0 || writeIdx >= RENDER_THREAD_FBO_COUNT) return;
+
+    std::atomic<GLsync>* fenceArray = isObsRequest ? g_obsFBOConsumerFences : g_renderFBOConsumerFences;
+    GLsync consumer = fenceArray[writeIdx].exchange(nullptr, std::memory_order_acq_rel);
+    if (consumer) {
+        // Guard in case a stale/invalid handle was left behind.
+        if (glIsSync(consumer)) { glWaitSync(consumer, 0, GL_TIMEOUT_IGNORED); }
+        glDeleteSync(consumer);
+    }
+}
 
 // Last known good texture - updated only after GPU fence confirms rendering complete
 // This ensures GetCompletedRenderTexture always returns a fully-rendered texture
@@ -63,10 +90,14 @@ static std::atomic<GLuint> g_lastGoodObsTexture{ 0 };
 static std::atomic<GLsync> g_lastGoodFence{ nullptr };
 static std::atomic<GLsync> g_lastGoodObsFence{ nullptr };
 
-// Ring buffer for deferred fence deletion - keeps fences alive for a few frames
-// This prevents TOCTOU race where a thread reads fence, then render thread deletes it
-// before the reading thread can use it. We delay deletion by 2 cycles.
-static constexpr size_t FENCE_DELETION_DELAY = 2;
+// Ring buffer for deferred fence deletion - keeps fences alive for a while.
+// This prevents a TOCTOU race where the main thread reads a fence pointer from
+// GetCompletedRenderFence(), gets preempted, and then the render thread deletes
+// that same fence after it has been rotated out.
+//
+// 2 frames is not enough at very high FPS (e.g. 1000fps => 2ms). A longer delay
+// is cheap (GLsync objects are tiny) and makes this robust under scheduler jitter.
+static constexpr size_t FENCE_DELETION_DELAY = 64;
 static GLsync g_pendingDeleteFences[FENCE_DELETION_DELAY] = { nullptr };
 static GLsync g_pendingDeleteObsFences[FENCE_DELETION_DELAY] = { nullptr };
 static size_t g_pendingDeleteIndex = 0;
@@ -114,14 +145,23 @@ static GLint g_vcLocHeight = -1;
 // This allows lock-free submission - main thread never blocks waiting for render thread
 static FrameRenderRequest g_requestSlots[2];
 static std::atomic<int> g_requestWriteSlot{ 0 };    // Slot main thread writes to next
-static std::atomic<bool> g_requestPending{ false }; // True when a request is ready to be consumed
+// IMPORTANT: FrameRenderRequest contains non-trivial types (std::string). With only 2 slots,
+// the producer can lap and overwrite the slot the render thread is currently copying from
+// (e.g. at very high FPS), which is a C++ data race and can manifest as a 1-frame "missing overlay".
+// We mark the slot being copied so the producer can avoid it.
+static std::atomic<int> g_requestReadSlot{ -1 };    // Slot currently being copied by render thread (-1 = none)
+// Mailbox: which slot currently contains the newest request ready to consume (-1 = none).
+// Producer stores with release AFTER fully writing the struct. Consumer exchanges with acq_rel
+// to guarantee it never copies a partially-written struct.
+static std::atomic<int> g_requestReadySlot{ -1 };
 static std::mutex g_requestSignalMutex;             // Only for CV signaling, not data protection
 static std::condition_variable g_requestCV;
 
 // Double-buffered OBS submission (same pattern)
 static ObsFrameSubmission g_obsSubmissionSlots[2];
 static std::atomic<int> g_obsWriteSlot{ 0 };
-static std::atomic<bool> g_obsSubmissionPending{ false };
+static std::atomic<int> g_obsReadSlot{ -1 }; // Slot currently being copied by render thread (-1 = none)
+static std::atomic<int> g_obsReadySlot{ -1 }; // Mailbox slot for newest OBS submission (-1 = none)
 
 static std::mutex g_completionMutex;
 static std::condition_variable g_completionCV;
@@ -2925,7 +2965,7 @@ static void RenderThreadFunc(void* gameGLContext) {
             {
                 std::unique_lock<std::mutex> lock(g_requestSignalMutex);
                 g_requestCV.wait_for(lock, std::chrono::milliseconds(16), [] {
-                    return g_requestPending.load(std::memory_order_acquire) || g_obsSubmissionPending.load(std::memory_order_acquire) ||
+                    return g_requestReadySlot.load(std::memory_order_acquire) != -1 || g_obsReadySlot.load(std::memory_order_acquire) != -1 ||
                            g_renderThreadShouldStop.load();
                 });
             }
@@ -2934,8 +2974,10 @@ static void RenderThreadFunc(void* gameGLContext) {
             if (g_renderThreadShouldStop.load()) break;
 
             // Check which request types are pending
-            bool hasObsRequest = g_obsSubmissionPending.exchange(false, std::memory_order_acq_rel);
-            bool hasMainRequest = g_requestPending.exchange(false, std::memory_order_acq_rel);
+            int obsSlot = g_obsReadySlot.exchange(-1, std::memory_order_acq_rel);
+            int mainSlot = g_requestReadySlot.exchange(-1, std::memory_order_acq_rel);
+            bool hasObsRequest = (obsSlot != -1);
+            bool hasMainRequest = (mainSlot != -1);
 
             if (!hasObsRequest && !hasMainRequest) {
                 continue; // Timeout, no request
@@ -2944,17 +2986,19 @@ static void RenderThreadFunc(void* gameGLContext) {
             // Process OBS request first if pending (virtual camera needs this)
             if (hasObsRequest) {
                 PROFILE_SCOPE_CAT("RT Build OBS Request", "Render Thread");
-                // Read from the slot that was last written
-                int readSlot = 1 - g_obsWriteSlot.load(std::memory_order_relaxed);
-                ObsFrameSubmission submission = g_obsSubmissionSlots[readSlot];
+                // Read the slot published to the mailbox.
+                g_obsReadSlot.store(obsSlot, std::memory_order_release);
+                ObsFrameSubmission submission = g_obsSubmissionSlots[obsSlot];
+                g_obsReadSlot.store(-1, std::memory_order_release);
                 // Build the full request on the render thread (deferred from main thread)
                 request = BuildObsFrameRequest(submission.context, submission.isDualRenderingPath);
                 request.gameTextureFence = submission.gameTextureFence;
                 isObsRequest = true;
             } else {
                 // Only main request pending
-                int readSlot = 1 - g_requestWriteSlot.load(std::memory_order_relaxed);
-                request = g_requestSlots[readSlot];
+                g_requestReadSlot.store(mainSlot, std::memory_order_release);
+                request = g_requestSlots[mainSlot];
+                g_requestReadSlot.store(-1, std::memory_order_release);
                 isObsRequest = false;
             }
 
@@ -2962,8 +3006,9 @@ static void RenderThreadFunc(void* gameGLContext) {
             FrameRenderRequest pendingMainRequest;
             bool hasPendingMain = hasObsRequest && hasMainRequest;
             if (hasPendingMain) {
-                int readSlot = 1 - g_requestWriteSlot.load(std::memory_order_relaxed);
-                pendingMainRequest = g_requestSlots[readSlot];
+                g_requestReadSlot.store(mainSlot, std::memory_order_release);
+                pendingMainRequest = g_requestSlots[mainSlot];
+                g_requestReadSlot.store(-1, std::memory_order_release);
             }
 
         // Label for processing a request (used to process both OBS and main in same iteration)
@@ -3014,6 +3059,9 @@ static void RenderThreadFunc(void* gameGLContext) {
             // Get current write FBO
             int writeIdx = writeFBOIndexPtr->load();
             RenderFBO& writeFBO = fboArray[writeIdx];
+
+            // Ensure the main thread has finished sampling this FBO's texture before we overwrite it.
+            RT_WaitForConsumerFence(isObsRequest, writeIdx);
 
             // Bind FBO and set viewport
             glBindFramebuffer(GL_FRAMEBUFFER, writeFBO.fbo);
@@ -3919,14 +3967,22 @@ void StartRenderThread(void* gameGLContext) {
     // Reset state
     g_renderThreadShouldStop.store(false);
     g_renderThreadRunning.store(true);
-    g_requestPending.store(false);
+    g_requestReadySlot.store(-1);
+    g_obsReadySlot.store(-1);
     g_frameComplete.store(false);
+    g_obsFrameComplete.store(false);
     g_writeFBOIndex.store(0);
     g_readFBOIndex.store(-1);
     g_lastGoodTexture.store(0);
     g_lastGoodObsTexture.store(0);
     g_framesRendered.store(0);
     g_framesDropped.store(0);
+
+    // Clear consumer fences (should already be null, but be safe across hot reloads)
+    for (int i = 0; i < RENDER_THREAD_FBO_COUNT; ++i) {
+        g_renderFBOConsumerFences[i].store(nullptr, std::memory_order_relaxed);
+        g_obsFBOConsumerFences[i].store(nullptr, std::memory_order_relaxed);
+    }
 
     // Start thread
     g_renderThread = std::thread(RenderThreadFunc, gameGLContext);
@@ -3951,19 +4007,27 @@ void SubmitFrameForRendering(const FrameRenderRequest& request) {
     // Lock-free submission using double-buffered slots
     // Main thread ALWAYS succeeds - never blocks waiting for render thread
 
-    // If there was a pending request we're overwriting, count it as dropped
-    if (g_requestPending.load(std::memory_order_relaxed)) { g_framesDropped.fetch_add(1, std::memory_order_relaxed); }
+    // If there was an unread request in the mailbox, this submission overwrites it (drop).
+    if (g_requestReadySlot.load(std::memory_order_relaxed) != -1) { g_framesDropped.fetch_add(1, std::memory_order_relaxed); }
 
-    // Write to current write slot
+    // Write to a slot that is NOT currently being copied by the render thread.
+    // With only 2 slots, a fast producer can otherwise lap and overwrite the slot being read.
     int writeSlot = g_requestWriteSlot.load(std::memory_order_relaxed);
+    int readSlotInUse = g_requestReadSlot.load(std::memory_order_acquire);
+    if (writeSlot == readSlotInUse) { writeSlot = 1 - writeSlot; }
+    if (writeSlot == readSlotInUse) {
+        // Extremely unlikely (would require invalid state), but never risk a data race.
+        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     g_requestSlots[writeSlot] = request;
 
     // Swap write slot so next submission goes to the other slot
     // This also tells render thread which slot to read from (the one we just wrote)
     g_requestWriteSlot.store(1 - writeSlot, std::memory_order_relaxed);
 
-    // Mark as pending
-    g_requestPending.store(true, std::memory_order_release);
+    // Publish to mailbox AFTER the full struct write completes.
+    g_requestReadySlot.store(writeSlot, std::memory_order_release);
     g_frameComplete.store(false, std::memory_order_relaxed);
 
     // Signal the condition variable (brief lock only for CV, not for data protection)
@@ -3998,6 +4062,26 @@ GLsync GetCompletedRenderFence() {
     return g_lastGoodFence.load(std::memory_order_acquire);
 }
 
+CompletedRenderFrame GetCompletedRenderFrame() {
+    CompletedRenderFrame out;
+    out.texture = g_lastGoodTexture.load(std::memory_order_acquire);
+    out.fence = g_lastGoodFence.load(std::memory_order_acquire);
+    out.fboIndex = FindFboIndexByTexture(g_renderFBOs, out.texture);
+    return out;
+}
+
+void SubmitRenderFBOConsumerFence(int fboIndex, GLsync consumerFence) {
+    if (!consumerFence) return;
+    if (fboIndex < 0 || fboIndex >= RENDER_THREAD_FBO_COUNT) {
+        // Can't associate it; delete to avoid leaking.
+        glDeleteSync(consumerFence);
+        return;
+    }
+
+    GLsync old = g_renderFBOConsumerFences[fboIndex].exchange(consumerFence, std::memory_order_acq_rel);
+    if (old) { glDeleteSync(old); }
+}
+
 void SubmitObsFrameContext(const ObsFrameSubmission& submission) {
     // Lock-free submission using double-buffered slots
     // Main thread ALWAYS succeeds - never blocks waiting for render thread
@@ -4008,15 +4092,26 @@ void SubmitObsFrameContext(const ObsFrameSubmission& submission) {
     // may have already copied the fence pointer and will try to delete it again.
     // Occasional fence leaks from dropped frames are acceptable and rare.
 
-    // Write to current write slot
+    // If there was an unread OBS submission in the mailbox, this submission overwrites it (drop).
+    if (g_obsReadySlot.load(std::memory_order_relaxed) != -1) { g_framesDropped.fetch_add(1, std::memory_order_relaxed); }
+
+    // Write to a slot that is NOT currently being copied by the render thread.
     int writeSlot = g_obsWriteSlot.load(std::memory_order_relaxed);
+    int readSlotInUse = g_obsReadSlot.load(std::memory_order_acquire);
+    if (writeSlot == readSlotInUse) { writeSlot = 1 - writeSlot; }
+    if (writeSlot == readSlotInUse) {
+        // Avoid data race on ObsFrameSubmission (contains std::string in context).
+        // If this happens, drop the submission.
+        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     g_obsSubmissionSlots[writeSlot] = submission;
 
     // Swap write slot
     g_obsWriteSlot.store(1 - writeSlot, std::memory_order_relaxed);
 
-    // Mark as pending
-    g_obsSubmissionPending.store(true, std::memory_order_release);
+    // Publish to mailbox AFTER the full struct write completes.
+    g_obsReadySlot.store(writeSlot, std::memory_order_release);
     g_obsFrameComplete.store(false, std::memory_order_relaxed);
 
     // Signal the condition variable

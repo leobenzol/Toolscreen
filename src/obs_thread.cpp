@@ -80,7 +80,7 @@ static void APIENTRY Hook_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX
                 // Wait on the render thread's fence to ensure texture is fully rendered
                 // glWaitSync is a GPU-side wait that doesn't block the CPU like glFinish
                 GLsync fence = GetCompletedObsFence();
-                if (fence) { glWaitSync(fence, 0, GL_TIMEOUT_IGNORED); }
+                if (fence && glIsSync(fence)) { glWaitSync(fence, 0, GL_TIMEOUT_IGNORED); }
 
                 // Memory barrier to ensure we see the latest texture data from render thread
                 // This is critical for cross-context texture sharing under GPU load

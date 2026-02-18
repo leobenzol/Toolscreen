@@ -3067,14 +3067,18 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
 
         // Blit previous frame's completed overlay render to screen
         // This introduces 1 frame of latency for overlays but keeps the main thread fast
-        GLuint completedTexture = GetCompletedRenderTexture();
+        CompletedRenderFrame completed = GetCompletedRenderFrame();
+        GLuint completedTexture = completed.texture;
         if (completedTexture != 0) {
             PROFILE_SCOPE_CAT("Blit Async Overlay Result", "Rendering");
 
             // Wait on the render thread's fence to ensure texture is fully rendered
             // glWaitSync is a GPU-side wait that doesn't block the CPU like glFinish
-            GLsync fence = GetCompletedRenderFence();
-            if (fence) { glWaitSync(fence, 0, GL_TIMEOUT_IGNORED); }
+            GLsync fence = completed.fence;
+            // NOTE: Under very high FPS / scheduler jitter, a fence can be rotated out and deleted
+            // by the render thread before we reach glWaitSync (TOCTOU). glIsSync guards against
+            // waiting on an invalid handle.
+            if (fence && glIsSync(fence)) { glWaitSync(fence, 0, GL_TIMEOUT_IGNORED); }
 
             // Memory barrier to ensure we see the latest texture data from render thread
             // This is critical for cross-context texture sharing under GPU load
@@ -3106,6 +3110,14 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
             glDrawArrays(GL_TRIANGLES, 0, 6);
 
             glDisable(GL_BLEND);
+
+            // Publish a consumer fence for this specific completed FBO.
+            // This prevents the render thread from reusing/clearing the same texture while the GPU
+            // is still sampling it for the composite.
+            if (completed.fboIndex >= 0) {
+                GLsync consumerFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                SubmitRenderFBOConsumerFence(completed.fboIndex, consumerFence);
+            }
 
             // Create fence after blit for delayRenderingUntilBlitted setting
             // Delete any existing fence first (shouldn't happen normally, but be safe)
