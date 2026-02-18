@@ -2785,7 +2785,9 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
     }
 
     // Handle window overlay dragging/resizing when drag mode is active (BEFORE rendering)
-    if (g_windowOverlayDragMode.load() && g_windowOverlaysVisible.load(std::memory_order_acquire)) {
+    // Dragging window overlays should only be possible while the GUI is open and the Window Overlays tab is active.
+    if (g_showGui.load(std::memory_order_relaxed) && g_windowOverlayDragMode.load(std::memory_order_relaxed) &&
+        g_windowOverlaysVisible.load(std::memory_order_acquire)) {
         PROFILE_SCOPE_CAT("Window Overlay Drag Mode", "Input Handling");
 
         // Skip if ImGui wants the mouse (user is interacting with GUI)

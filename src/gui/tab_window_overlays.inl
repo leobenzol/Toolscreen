@@ -427,4 +427,7 @@ if (ImGui::BeginTabItem("Window Overlays")) {
     }
 
     ImGui::EndTabItem();
+} else {
+    // Ensure we can't drag window overlays while this tab is not active.
+    g_windowOverlayDragMode.store(false);
 }

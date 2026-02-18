@@ -2684,6 +2684,12 @@ void RenderSettingsGUI() {
 
         ImGui::Separator();
 
+        // Drag modes must only be enabled by the currently active tab.
+        // Without this reset, leaving a tab could leave drag mode enabled and allow overlays to be moved while the user
+        // is in a different tab (or after other GUI transitions).
+        g_imageDragMode.store(false, std::memory_order_relaxed);
+        g_windowOverlayDragMode.store(false, std::memory_order_relaxed);
+
         if (g_config.basicModeEnabled) {
             // --- BASIC MODE: Only General and Other tabs ---
             if (ImGui::BeginTabBar("BasicSettingsTabs")) {
@@ -2746,6 +2752,8 @@ void RenderSettingsGUI() {
 
     } else {
         g_currentlyEditingMirror = "";
+        g_imageDragMode.store(false, std::memory_order_relaxed);
+        g_windowOverlayDragMode.store(false, std::memory_order_relaxed);
     }
     ImGui::End();
 
