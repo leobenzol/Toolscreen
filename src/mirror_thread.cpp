@@ -790,15 +790,32 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
         // Note: We do NOT invalidate g_lastCopyReadIndex here - it continues pointing to
         // the old texture until a successful blit completes. This prevents getting stuck
         // in an invalid state if blits fail due to race conditions.
+
+        // CRITICAL: Invalidate the ready frame BEFORE resizing textures.
+        // glTexImage2D replaces the backing storage with undefined content, so any
+        // thread reading the "ready" texture would get garbage/black data. This was
+        // causing visual freezes on some devices: the render thread would keep blitting
+        // the stale ready frame (now undefined) instead of showing new content.
+        g_readyFrameIndex.store(-1, std::memory_order_release);
+        g_readyFrameWidth.store(0, std::memory_order_release);
+        g_readyFrameHeight.store(0, std::memory_order_release);
+
         for (int i = 0; i < 2; i++) {
             glBindTexture(GL_TEXTURE_2D, g_copyTextures[i]);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         }
         glBindTexture(GL_TEXTURE_2D, 0);
 
-        // CRITICAL: Wait for GPU to complete texture resize before proceeding
-        // This prevents race conditions where we try to use the texture before resize is done
-        glFinish();
+        // Use fence + flush instead of glFinish() to avoid blocking the game thread.
+        // glFinish() stalls the entire GL pipeline until ALL commands complete, which can
+        // cause visible hitches on some GPU/driver combinations (especially iGPUs).
+        // A fence only waits for the texture reallocation commands specifically.
+        GLsync resizeFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush(); // Ensure fence and resize commands are submitted to GPU
+        if (resizeFence) {
+            glClientWaitSync(resizeFence, GL_SYNC_FLUSH_COMMANDS_BIT, 500000000ULL); // 500ms timeout
+            glDeleteSync(resizeFence);
+        }
 
         g_copyTextureW = width;
         g_copyTextureH = height;

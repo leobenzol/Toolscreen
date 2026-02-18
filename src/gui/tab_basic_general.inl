@@ -227,7 +227,7 @@ if (ImGui::BeginTabItem("General")) {
 
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SetNextItemWidth(10.0f);
                 int maxCloneWidth = (modeConfig ? modeConfig->width : maxWidth);
                 if (maxCloneWidth < 2) maxCloneWidth = 2;
                 if (Spinner("##EyeZoomCloneWidth", &g_config.eyezoom.cloneWidth, 2, 2, maxCloneWidth)) {
@@ -240,7 +240,7 @@ if (ImGui::BeginTabItem("General")) {
                 }
 
                 ImGui::TableSetColumnIndex(1);
-                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SetNextItemWidth(10.0f);
                 {
                     int maxOverlay = g_config.eyezoom.cloneWidth / 2;
                     if (Spinner("##EyeZoomOverlayWidth", &g_config.eyezoom.overlayWidth, 1, 0, maxOverlay)) g_configIsDirty = true;

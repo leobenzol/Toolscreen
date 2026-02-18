@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <windows.h>
@@ -170,7 +171,7 @@ GLuint GetEyeZoomSnapshotTexture();
 int GetEyeZoomSnapshotWidth();
 int GetEyeZoomSnapshotHeight();
 
-extern std::map<std::string, MirrorInstance> g_mirrorInstances;
+extern std::unordered_map<std::string, MirrorInstance> g_mirrorInstances;
 
 // Animated background texture instance
 struct BackgroundTextureInstance {
@@ -184,8 +185,8 @@ struct BackgroundTextureInstance {
     std::chrono::steady_clock::time_point lastFrameTime;
 };
 
-extern std::map<std::string, BackgroundTextureInstance> g_backgroundTextures;
-extern std::map<std::string, UserImageInstance> g_userImages;
+extern std::unordered_map<std::string, BackgroundTextureInstance> g_backgroundTextures;
+extern std::unordered_map<std::string, UserImageInstance> g_userImages;
 extern GLuint g_vao;
 extern GLuint g_vbo;
 extern GLuint g_debugVAO;

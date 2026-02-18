@@ -154,6 +154,7 @@ std::atomic<bool> g_eyeZoomFontNeedsReload{ false };
 static ImFont* g_eyeZoomTextFont = nullptr;
 static std::string g_eyeZoomFontPathCached = "";
 static float g_eyeZoomScaleFactor = 1.0f;
+static bool g_fontsValid = false; // True when font atlas is built and texture is uploaded; false during rebuild
 
 // Font loading can fail or behave inconsistently with some font files.
 // We treat any font that can't be built reliably as invalid and fall back to Arial.
@@ -251,6 +252,7 @@ static bool RT_TryInitializeImGui(HWND hwnd, const Config& cfg) {
     // Initialize larger font for overlay text labels
     InitializeOverlayTextFont(cfg.fontPath, 16.0f, scaleFactor);
 
+    g_fontsValid = true;
     g_renderThreadImGuiInitialized = true;
     LogCategory("init", "Render Thread: ImGui initialized successfully");
     return true;
@@ -1078,6 +1080,10 @@ static void RT_RenderBackground(bool isImage, GLuint bgTexture, float bgR, float
 }
 
 static void InitRenderFBOs(int width, int height) {
+    // Track whether any main or OBS FBO was resized
+    bool mainResized = false;
+    bool obsResized = false;
+
     // Initialize main overlay FBOs
     for (int i = 0; i < RENDER_THREAD_FBO_COUNT; i++) {
         RenderFBO& fbo = g_renderFBOs[i];
@@ -1116,11 +1122,24 @@ static void InitRenderFBOs(int width, int height) {
 
             fbo.width = width;
             fbo.height = height;
+            mainResized = true;
             LogCategory("init", "RenderThread: Initialized FBO " + std::to_string(i) + " at " + std::to_string(width) + "x" +
                                     std::to_string(height));
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    // Invalidate last good texture when FBOs are resized.
+    // glTexImage2D replaces the texture backing storage, so the old g_lastGoodTexture
+    // (which uses the same GL name) now points to undefined content. The main thread
+    // reading this would display garbage/frozen frames. Clear it so the main thread
+    // skips blitting until a fresh frame is rendered into the new FBO.
+    if (mainResized) {
+        g_lastGoodTexture.store(0, std::memory_order_release);
+        // Clear the fence pointer so the main thread doesn't wait on a stale fence.
+        // Don't delete the old fence - it's managed by the deferred deletion ring buffer.
+        (void)g_lastGoodFence.exchange(nullptr, std::memory_order_acq_rel);
     }
 
     // Initialize OBS animated frame FBOs
@@ -1135,6 +1154,7 @@ static void InitRenderFBOs(int width, int height) {
         if (fbo.stencilRbo == 0) { glGenRenderbuffers(1, &fbo.stencilRbo); }
 
         if (fbo.width != width || fbo.height != height) {
+            obsResized = true;
             glBindTexture(GL_TEXTURE_2D, fbo.texture);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1162,6 +1182,17 @@ static void InitRenderFBOs(int width, int height) {
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    // Invalidate last good OBS texture when OBS FBOs are resized (same reasoning as main FBOs)
+    if (obsResized) {
+        g_lastGoodObsTexture.store(0, std::memory_order_release);
+        (void)g_lastGoodObsFence.exchange(nullptr, std::memory_order_acq_rel);
+    }
+
+    // Flush to ensure all FBO resize commands are submitted to GPU before rendering
+    if (mainResized || obsResized) {
+        glFlush();
     }
 }
 
@@ -1607,13 +1638,20 @@ static void RT_RenderGameTexture(GLuint gameTexture, int x, int y, int w, int h,
 // This renders the magnified game texture, colored boxes, center line, and caches text labels
 static void RT_RenderEyeZoom(GLuint gameTexture, int requestViewportX, int fullW, int fullH, int gameTexW, int gameTexH, GLuint vao,
                              GLuint vbo, bool isTransitioningFromEyeZoom = false, GLuint snapshotTexture = 0, int snapshotWidth = 0,
-                             int snapshotHeight = 0) {
+                             int snapshotHeight = 0, const EyeZoomConfig* externalZoomConfig = nullptr) {
     if (gameTexture == UINT_MAX) return;
 
-    // Get EyeZoom config
-    auto zoomCfgSnap = GetConfigSnapshot();
-    if (!zoomCfgSnap) return; // Config not yet published
-    EyeZoomConfig zoomConfig = zoomCfgSnap->eyezoom;
+    // Use externally-provided config snapshot if available, otherwise grab our own.
+    // Using the caller's snapshot avoids a TOCTOU race where the config changes between
+    // the box renderer and the text renderer within the same frame.
+    EyeZoomConfig zoomConfig;
+    if (externalZoomConfig) {
+        zoomConfig = *externalZoomConfig;
+    } else {
+        auto zoomCfgSnap = GetConfigSnapshot();
+        if (!zoomCfgSnap) return; // Config not yet published
+        zoomConfig = zoomCfgSnap->eyezoom;
+    }
 
     // Calculate target position (final destination for EyeZoom mode)
     int modeWidth = zoomConfig.windowWidth;
@@ -1738,8 +1776,9 @@ static void RT_RenderEyeZoom(GLuint gameTexture, int requestViewportX, int fullW
 
         // CAPTURE SNAPSHOT: Store the EyeZoom output for transition-out animation
         // Only capture when we're NOT transitioning from EyeZoom (stable or transitioning TO)
-        // Also check the global atomic flag to catch the case where transition started after request was built
-        bool shouldFreezeSnapshot = isTransitioningFromEyeZoom || g_isTransitioningFromEyeZoom.load(std::memory_order_acquire);
+        // Use only the function parameter (from the request) - avoids race where global atomic
+        // changes mid-frame causing desync between snapshot and rendering state
+        bool shouldFreezeSnapshot = isTransitioningFromEyeZoom;
         if (!shouldFreezeSnapshot) {
             // Resize snapshot texture if needed
             if (rt_eyeZoomSnapshotTexture == 0 || rt_eyeZoomSnapshotWidth != zoomOutputWidth ||
@@ -2849,6 +2888,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                 // Initialize larger font for overlay text labels
                 InitializeOverlayTextFont(fontPath, 16.0f, scaleFactor);
 
+                g_fontsValid = true;
                 g_renderThreadImGuiInitialized = true;
                 LogCategory("init", "Render Thread: ImGui initialized successfully");
             } else {
@@ -3140,7 +3180,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                         // Also pass snapshot texture for transition-out consistency
                         RT_RenderEyeZoom(readyTex, request.eyeZoomAnimatedViewportX, request.fullW, request.fullH, srcW, srcH, renderVAO,
                                          renderVBO, request.isTransitioningFromEyeZoom, request.eyeZoomSnapshotTexture,
-                                         request.eyeZoomSnapshotWidth, request.eyeZoomSnapshotHeight);
+                                         request.eyeZoomSnapshotWidth, request.eyeZoomSnapshotHeight, &cfg.eyezoom);
                     }
                 }
                 // If no ready frame and no fallback available, just show background (first few frames at startup)
@@ -3261,7 +3301,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                     PROFILE_SCOPE_CAT("RT EyeZoom Render", "Render Thread");
                     RT_RenderEyeZoom(readyTex, request.eyeZoomAnimatedViewportX, request.fullW, request.fullH, srcW, srcH, renderVAO,
                                      renderVBO, request.isTransitioningFromEyeZoom, request.eyeZoomSnapshotTexture,
-                                     request.eyeZoomSnapshotWidth, request.eyeZoomSnapshotHeight);
+                                     request.eyeZoomSnapshotWidth, request.eyeZoomSnapshotHeight, &cfg.eyezoom);
                 }
             }
 
@@ -3390,6 +3430,9 @@ static void RenderThreadFunc(void* gameGLContext) {
                         Log("Render Thread: Reloading EyeZoom font from " + newFontPath);
                         ImGuiIO& io = ImGui::GetIO();
 
+                        // Mark fonts invalid during rebuild to prevent text rendering with stale/dangling font data
+                        g_fontsValid = false;
+
                         // Rebuild the atlas from scratch to avoid unbounded growth and stale pointers.
                         // If the requested font is unstable, we ignore it and fall back to Arial.
                         io.Fonts->Clear();
@@ -3421,6 +3464,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                         ImGui_ImplOpenGL3_DestroyFontsTexture();
                         ImGui_ImplOpenGL3_CreateFontsTexture();
 
+                        g_fontsValid = true;
                         Log("Render Thread: Fonts reloaded successfully");
                     }
                 }
@@ -3453,7 +3497,8 @@ static void RenderThreadFunc(void* gameGLContext) {
                 // Render eye zoom text labels directly for all request types
                 // Boxes and text are now both rendered in the same FBO using the same request values,
                 // so they stay synchronized during transitions
-                if (request.showEyeZoom && request.eyeZoomFadeOpacity > 0.0f) {
+                // Skip text rendering when fonts are being rebuilt to avoid rendering with invalid font data
+                if (request.showEyeZoom && request.eyeZoomFadeOpacity > 0.0f && g_fontsValid) {
                     // Calculate EyeZoom text positions directly
                     EyeZoomConfig zoomConfig = cfg.eyezoom;
 
@@ -3467,7 +3512,8 @@ static void RenderThreadFunc(void* gameGLContext) {
 
                     // Calculate dimensions and position - must match RT_RenderEyeZoom logic
                     int zoomOutputWidth, zoomX;
-                    bool isTransitioningFromEyeZoom = g_isTransitioningFromEyeZoom.load(std::memory_order_relaxed);
+                    // Use request value, NOT global atomic - ensures text and boxes use identical transition state
+                    bool isTransitioningFromEyeZoom = request.isTransitioningFromEyeZoom;
                     bool isTransitioningToEyeZoom = (viewportX < targetViewportX && !isTransitioningFromEyeZoom);
 
                     if (zoomConfig.slideZoomIn) {

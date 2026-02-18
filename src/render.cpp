@@ -100,13 +100,20 @@ static int s_eyeZoomSnapshotWidth = 0;
 static int s_eyeZoomSnapshotHeight = 0;
 static bool s_eyeZoomSnapshotValid = false;
 
+// PERF: Cached FBOs for EyeZoom rendering - avoids per-frame GPU object creation/destruction
+static GLuint s_eyeZoomTempFBO = 0;       // Temp FBO for opacity < 1.0 compositing
+static GLuint s_eyeZoomTempTexture = 0;   // Temp texture for opacity < 1.0 compositing
+static int s_eyeZoomTempWidth = 0;
+static int s_eyeZoomTempHeight = 0;
+static GLuint s_eyeZoomBlitFBO = 0;       // Reusable FBO for binding game texture as read source
+
 GLuint GetEyeZoomSnapshotTexture() { return s_eyeZoomSnapshotTexture; }
 int GetEyeZoomSnapshotWidth() { return s_eyeZoomSnapshotWidth; }
 int GetEyeZoomSnapshotHeight() { return s_eyeZoomSnapshotHeight; }
 
-std::map<std::string, MirrorInstance> g_mirrorInstances;
-std::map<std::string, BackgroundTextureInstance> g_backgroundTextures;
-std::map<std::string, UserImageInstance> g_userImages;
+std::unordered_map<std::string, MirrorInstance> g_mirrorInstances;
+std::unordered_map<std::string, BackgroundTextureInstance> g_backgroundTextures;
+std::unordered_map<std::string, UserImageInstance> g_userImages;
 GLuint g_vao = 0;
 GLuint g_vbo = 0;
 GLuint g_debugVAO = 0;
@@ -293,79 +300,60 @@ void RenderGameBorder(int x, int y, int w, int h, int borderWidth, int radius, c
     auto toNdcY = [fullH](int py) { return (static_cast<float>(py) / fullH) * 2.0f - 1.0f; };
 
     if (effectiveRadius <= 0) {
-        // Sharp corners: render 4 border rectangles
-        // Top border (extends from outerLeft to outerRight, at outerTop edge)
-        float topBorder[] = { toNdcX(outerLeft),  toNdcY(y_gl + h), 0, 0, toNdcX(outerRight), toNdcY(y_gl + h), 0, 0,
-                              toNdcX(outerRight), toNdcY(outerTop), 0, 0, toNdcX(outerLeft),  toNdcY(y_gl + h), 0, 0,
-                              toNdcX(outerRight), toNdcY(outerTop), 0, 0, toNdcX(outerLeft),  toNdcY(outerTop), 0, 0 };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(topBorder), topBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Bottom border
-        float bottomBorder[] = { toNdcX(outerLeft),  toNdcY(outerBottom), 0, 0, toNdcX(outerRight), toNdcY(outerBottom), 0, 0,
-                                 toNdcX(outerRight), toNdcY(y_gl),        0, 0, toNdcX(outerLeft),  toNdcY(outerBottom), 0, 0,
-                                 toNdcX(outerRight), toNdcY(y_gl),        0, 0, toNdcX(outerLeft),  toNdcY(y_gl),        0, 0 };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(bottomBorder), bottomBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Left border (between top and bottom borders)
-        float leftBorder[] = { toNdcX(outerLeft), toNdcY(y_gl),     0, 0, toNdcX(x),         toNdcY(y_gl),     0, 0,
-                               toNdcX(x),         toNdcY(y_gl + h), 0, 0, toNdcX(outerLeft), toNdcY(y_gl),     0, 0,
-                               toNdcX(x),         toNdcY(y_gl + h), 0, 0, toNdcX(outerLeft), toNdcY(y_gl + h), 0, 0 };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(leftBorder), leftBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Right border
-        float rightBorder[] = { toNdcX(x + w),      toNdcY(y_gl),     0, 0, toNdcX(outerRight), toNdcY(y_gl),     0, 0,
-                                toNdcX(outerRight), toNdcY(y_gl + h), 0, 0, toNdcX(x + w),      toNdcY(y_gl),     0, 0,
-                                toNdcX(outerRight), toNdcY(y_gl + h), 0, 0, toNdcX(x + w),      toNdcY(y_gl + h), 0, 0 };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(rightBorder), rightBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+        // PERF: Batch all 4 sharp-corner border rectangles into a single upload and draw call
+        float allBorders[] = {
+            // Top border
+            toNdcX(outerLeft),  toNdcY(y_gl + h), 0, 0, toNdcX(outerRight), toNdcY(y_gl + h), 0, 0,
+            toNdcX(outerRight), toNdcY(outerTop),  0, 0, toNdcX(outerLeft),  toNdcY(y_gl + h), 0, 0,
+            toNdcX(outerRight), toNdcY(outerTop),  0, 0, toNdcX(outerLeft),  toNdcY(outerTop),  0, 0,
+            // Bottom border
+            toNdcX(outerLeft),  toNdcY(outerBottom), 0, 0, toNdcX(outerRight), toNdcY(outerBottom), 0, 0,
+            toNdcX(outerRight), toNdcY(y_gl),        0, 0, toNdcX(outerLeft),  toNdcY(outerBottom), 0, 0,
+            toNdcX(outerRight), toNdcY(y_gl),        0, 0, toNdcX(outerLeft),  toNdcY(y_gl),        0, 0,
+            // Left border
+            toNdcX(outerLeft), toNdcY(y_gl),     0, 0, toNdcX(x),         toNdcY(y_gl),     0, 0,
+            toNdcX(x),         toNdcY(y_gl + h), 0, 0, toNdcX(outerLeft), toNdcY(y_gl),     0, 0,
+            toNdcX(x),         toNdcY(y_gl + h), 0, 0, toNdcX(outerLeft), toNdcY(y_gl + h), 0, 0,
+            // Right border
+            toNdcX(x + w),      toNdcY(y_gl),     0, 0, toNdcX(outerRight), toNdcY(y_gl),     0, 0,
+            toNdcX(outerRight), toNdcY(y_gl + h), 0, 0, toNdcX(x + w),      toNdcY(y_gl),     0, 0,
+            toNdcX(outerRight), toNdcY(y_gl + h), 0, 0, toNdcX(x + w),      toNdcY(y_gl + h), 0, 0
+        };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(allBorders), allBorders);
+        glDrawArrays(GL_TRIANGLES, 0, 24);
     } else {
         // Rounded corners: render border segments and corner arcs
-        // For simplicity, use quad approximation for rounded corners
         int segments = 8; // Number of segments per corner
 
-        // Top border (between corners)
-        float topBorder[] = {
+        // PERF: Batch all 4 straight border segments into a single draw call
+        float straightBorders[] = {
+            // Top border (between corners)
             toNdcX(x + effectiveRadius),     toNdcY(y_gl + h), 0, 0, toNdcX(x + w - effectiveRadius), toNdcY(y_gl + h), 0, 0,
             toNdcX(x + w - effectiveRadius), toNdcY(outerTop), 0, 0, toNdcX(x + effectiveRadius),     toNdcY(y_gl + h), 0, 0,
-            toNdcX(x + w - effectiveRadius), toNdcY(outerTop), 0, 0, toNdcX(x + effectiveRadius),     toNdcY(outerTop), 0, 0
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(topBorder), topBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Bottom border
-        float bottomBorder[] = {
+            toNdcX(x + w - effectiveRadius), toNdcY(outerTop), 0, 0, toNdcX(x + effectiveRadius),     toNdcY(outerTop), 0, 0,
+            // Bottom border
             toNdcX(x + effectiveRadius),     toNdcY(outerBottom), 0, 0, toNdcX(x + w - effectiveRadius), toNdcY(outerBottom), 0, 0,
             toNdcX(x + w - effectiveRadius), toNdcY(y_gl),        0, 0, toNdcX(x + effectiveRadius),     toNdcY(outerBottom), 0, 0,
-            toNdcX(x + w - effectiveRadius), toNdcY(y_gl),        0, 0, toNdcX(x + effectiveRadius),     toNdcY(y_gl),        0, 0
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(bottomBorder), bottomBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Left border
-        float leftBorder[] = {
+            toNdcX(x + w - effectiveRadius), toNdcY(y_gl),        0, 0, toNdcX(x + effectiveRadius),     toNdcY(y_gl),        0, 0,
+            // Left border
             toNdcX(outerLeft), toNdcY(y_gl + effectiveRadius),     0, 0, toNdcX(x),         toNdcY(y_gl + effectiveRadius),     0, 0,
             toNdcX(x),         toNdcY(y_gl + h - effectiveRadius), 0, 0, toNdcX(outerLeft), toNdcY(y_gl + effectiveRadius),     0, 0,
-            toNdcX(x),         toNdcY(y_gl + h - effectiveRadius), 0, 0, toNdcX(outerLeft), toNdcY(y_gl + h - effectiveRadius), 0, 0
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(leftBorder), leftBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Right border
-        float rightBorder[] = {
+            toNdcX(x),         toNdcY(y_gl + h - effectiveRadius), 0, 0, toNdcX(outerLeft), toNdcY(y_gl + h - effectiveRadius), 0, 0,
+            // Right border
             toNdcX(x + w),      toNdcY(y_gl + effectiveRadius),     0, 0, toNdcX(outerRight), toNdcY(y_gl + effectiveRadius),     0, 0,
             toNdcX(outerRight), toNdcY(y_gl + h - effectiveRadius), 0, 0, toNdcX(x + w),      toNdcY(y_gl + effectiveRadius),     0, 0,
             toNdcX(outerRight), toNdcY(y_gl + h - effectiveRadius), 0, 0, toNdcX(x + w),      toNdcY(y_gl + h - effectiveRadius), 0, 0
         };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(rightBorder), rightBorder);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(straightBorders), straightBorders);
+        glDrawArrays(GL_TRIANGLES, 0, 24);
 
-        // Render rounded corners using triangle fan approximation
-        // Each corner is rendered as a series of triangles
+        // PERF: Batch all arc segments per corner into a single draw call instead of per-segment draws
+        // Each corner has 'segments' arc pieces, each piece = 6 vertices (2 triangles)
+        // 4 corners * segments * 6 verts * 4 floats
         auto renderCornerArc = [&](float centerX, float centerY, float innerR, float outerR, float startAngle, float endAngle) {
             float angleStep = (endAngle - startAngle) / segments;
+            std::vector<float> arcVerts;
+            arcVerts.reserve(segments * 6 * 4);
             for (int s = 0; s < segments; s++) {
                 float a1 = startAngle + s * angleStep;
                 float a2 = startAngle + (s + 1) * angleStep;
@@ -373,19 +361,18 @@ void RenderGameBorder(int x, int y, int w, int h, int borderWidth, int radius, c
                 float c1 = cosf(a1), s1 = sinf(a1);
                 float c2 = cosf(a2), s2 = sinf(a2);
 
-                // Two triangles to form a segment of the arc ring
-                float arcTriangles[] = { // Triangle 1: inner1, outer1, outer2
-                                         toNdcX((int)(centerX + innerR * c1)), toNdcY((int)(centerY + innerR * s1)), 0, 0,
-                                         toNdcX((int)(centerX + outerR * c1)), toNdcY((int)(centerY + outerR * s1)), 0, 0,
-                                         toNdcX((int)(centerX + outerR * c2)), toNdcY((int)(centerY + outerR * s2)), 0, 0,
-                                         // Triangle 2: inner1, outer2, inner2
-                                         toNdcX((int)(centerX + innerR * c1)), toNdcY((int)(centerY + innerR * s1)), 0, 0,
-                                         toNdcX((int)(centerX + outerR * c2)), toNdcY((int)(centerY + outerR * s2)), 0, 0,
-                                         toNdcX((int)(centerX + innerR * c2)), toNdcY((int)(centerY + innerR * s2)), 0, 0
+                float tri[] = {
+                    toNdcX((int)(centerX + innerR * c1)), toNdcY((int)(centerY + innerR * s1)), 0, 0,
+                    toNdcX((int)(centerX + outerR * c1)), toNdcY((int)(centerY + outerR * s1)), 0, 0,
+                    toNdcX((int)(centerX + outerR * c2)), toNdcY((int)(centerY + outerR * s2)), 0, 0,
+                    toNdcX((int)(centerX + innerR * c1)), toNdcY((int)(centerY + innerR * s1)), 0, 0,
+                    toNdcX((int)(centerX + outerR * c2)), toNdcY((int)(centerY + outerR * s2)), 0, 0,
+                    toNdcX((int)(centerX + innerR * c2)), toNdcY((int)(centerY + innerR * s2)), 0, 0
                 };
-                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(arcTriangles), arcTriangles);
-                glDrawArrays(GL_TRIANGLES, 0, 6);
+                arcVerts.insert(arcVerts.end(), std::begin(tri), std::end(tri));
             }
+            glBufferSubData(GL_ARRAY_BUFFER, 0, arcVerts.size() * sizeof(float), arcVerts.data());
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(arcVerts.size() / 4));
         };
 
         const float PI = 3.14159265358979323846f;
@@ -1574,7 +1561,7 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
     const int fullH = GetCachedScreenHeight();
 
     // Check if we're transitioning FROM EyeZoom (use snapshot) or stable/transitioning TO (use live)
-    bool useSnapshot = g_isTransitioningFromEyeZoom.load(std::memory_order_relaxed);
+    bool useSnapshot = g_isTransitioningFromEyeZoom.load(std::memory_order_acquire);
 
     // Use cached game texture directly (for live rendering)
     GLuint gameTextureToUse = g_cachedGameTextureId.load();
@@ -1663,19 +1650,27 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
 
     // For opacity < 1.0, we need to render to a temporary texture first, then blend to screen
     if (opacity < 1.0f) {
-        // Create temporary FBO for the zoom output
-        GLuint tempZoomFBO = 0;
-        GLuint tempZoomTexture = 0;
-        glGenFramebuffers(1, &tempZoomFBO);
-        glGenTextures(1, &tempZoomTexture);
+        // PERF: Reuse cached FBO/texture - only reallocate when dimensions change
+        if (s_eyeZoomTempTexture == 0 || s_eyeZoomTempWidth != zoomOutputWidth || s_eyeZoomTempHeight != zoomOutputHeight) {
+            if (s_eyeZoomTempTexture != 0) { glDeleteTextures(1, &s_eyeZoomTempTexture); }
+            if (s_eyeZoomTempFBO != 0) { glDeleteFramebuffers(1, &s_eyeZoomTempFBO); }
 
-        glBindTexture(GL_TEXTURE_2D, tempZoomTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, zoomOutputWidth, zoomOutputHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glGenFramebuffers(1, &s_eyeZoomTempFBO);
+            glGenTextures(1, &s_eyeZoomTempTexture);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, tempZoomFBO);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tempZoomTexture, 0);
+            glBindTexture(GL_TEXTURE_2D, s_eyeZoomTempTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, zoomOutputWidth, zoomOutputHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            glBindFramebuffer(GL_FRAMEBUFFER, s_eyeZoomTempFBO);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_eyeZoomTempTexture, 0);
+
+            s_eyeZoomTempWidth = zoomOutputWidth;
+            s_eyeZoomTempHeight = zoomOutputHeight;
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, s_eyeZoomTempFBO);
         if (oglViewport)
             oglViewport(0, 0, zoomOutputWidth, zoomOutputHeight);
         else
@@ -1685,19 +1680,16 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // Blit from game texture to temp FBO
-        GLuint srcFBO = 0;
-        glGenFramebuffers(1, &srcFBO);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFBO);
+        // Blit from game texture to temp FBO using cached blit FBO
+        if (s_eyeZoomBlitFBO == 0) { glGenFramebuffers(1, &s_eyeZoomBlitFBO); }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, s_eyeZoomBlitFBO);
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gameTextureToUse, 0);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tempZoomFBO);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_eyeZoomTempFBO);
 
         glBlitFramebuffer(srcLeft, srcBottom, srcRight, srcTop, 0, 0, zoomOutputWidth, zoomOutputHeight, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-        glDeleteFramebuffers(1, &srcFBO);
-
         // Now render the colored boxes and center line to the temp FBO
-        glBindFramebuffer(GL_FRAMEBUFFER, tempZoomFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_eyeZoomTempFBO);
         if (oglViewport)
             oglViewport(0, 0, zoomOutputWidth, zoomOutputHeight);
         else
@@ -1723,38 +1715,50 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
             boxHeight = static_cast<float>(zoomConfig.rectHeight);
         }
 
+        // PERF: Batch all overlay boxes into two groups (even/odd color) for 2 draw calls instead of N
+        std::vector<float> evenVerts, oddVerts;
+        evenVerts.reserve(overlayLabelsPerSide * 6 * 4);
+        oddVerts.reserve(overlayLabelsPerSide * 6 * 4);
+
         for (int xOffset = -overlayLabelsPerSide; xOffset <= overlayLabelsPerSide; xOffset++) {
             if (xOffset == 0) continue;
 
-            // Map xOffset (relative to center) to the full clone column index [0..cloneWidth-1]
             int boxIndex = xOffset + labelsPerSide - (xOffset > 0 ? 1 : 0);
             float boxLeft = boxIndex * pixelWidthOnScreen;
             float boxRight = boxLeft + pixelWidthOnScreen;
             float boxBottom_local = centerY_local - boxHeight / 2.0f;
             float boxTop_local = centerY_local + boxHeight / 2.0f;
 
-            Color boxColor = (boxIndex % 2 == 0) ? zoomConfig.gridColor1 : zoomConfig.gridColor2;
-            float boxOpacity = (boxIndex % 2 == 0) ? zoomConfig.gridColor1Opacity : zoomConfig.gridColor2Opacity;
-            glUniform4f(g_solidColorShaderLocs.color, boxColor.r, boxColor.g, boxColor.b, boxOpacity);
-
-            // Convert to NDC in temp texture space
             float boxNdcLeft = (boxLeft / (float)zoomOutputWidth) * 2.0f - 1.0f;
             float boxNdcRight = (boxRight / (float)zoomOutputWidth) * 2.0f - 1.0f;
             float boxNdcBottom = (boxBottom_local / (float)zoomOutputHeight) * 2.0f - 1.0f;
             float boxNdcTop = (boxTop_local / (float)zoomOutputHeight) * 2.0f - 1.0f;
 
-            float boxVerts[] = {
+            auto& verts = (boxIndex % 2 == 0) ? evenVerts : oddVerts;
+            float quad[] = {
                 boxNdcLeft, boxNdcBottom, 0, 0, boxNdcRight, boxNdcBottom, 0, 0, boxNdcRight, boxNdcTop, 0, 0,
                 boxNdcLeft, boxNdcBottom, 0, 0, boxNdcRight, boxNdcTop,    0, 0, boxNdcLeft,  boxNdcTop, 0, 0,
             };
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxVerts), boxVerts);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+            verts.insert(verts.end(), std::begin(quad), std::end(quad));
 
             // Cache text labels with screen coordinates (will be rendered during ImGui pass)
             int displayNumber = abs(xOffset);
             float numberCenterX = zoomX + boxLeft + pixelWidthOnScreen / 2.0f;
             float numberCenterY = zoomY + zoomOutputHeight / 2.0f;
             CacheEyeZoomTextLabel(displayNumber, numberCenterX, numberCenterY, zoomConfig.textColor);
+        }
+
+        // Draw even-index boxes
+        if (!evenVerts.empty()) {
+            glUniform4f(g_solidColorShaderLocs.color, zoomConfig.gridColor1.r, zoomConfig.gridColor1.g, zoomConfig.gridColor1.b, zoomConfig.gridColor1Opacity);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, evenVerts.size() * sizeof(float), evenVerts.data());
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(evenVerts.size() / 4));
+        }
+        // Draw odd-index boxes
+        if (!oddVerts.empty()) {
+            glUniform4f(g_solidColorShaderLocs.color, zoomConfig.gridColor2.r, zoomConfig.gridColor2.g, zoomConfig.gridColor2.b, zoomConfig.gridColor2Opacity);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, oddVerts.size() * sizeof(float), oddVerts.data());
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(oddVerts.size() / 4));
         }
 
         // Draw center line in temp texture
@@ -1789,7 +1793,7 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
         glUseProgram(g_imageRenderProgram);
-        glBindTexture(GL_TEXTURE_2D, tempZoomTexture);
+        glBindTexture(GL_TEXTURE_2D, s_eyeZoomTempTexture);
         glUniform1i(g_imageRenderShaderLocs.imageTexture, 0);
         glUniform1i(g_imageRenderShaderLocs.enableColorKey, 0);
         glUniform1f(g_imageRenderShaderLocs.opacity, opacity);
@@ -1803,10 +1807,6 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
         float rv[] = { nx1, ny1, 0, 0, nx2, ny1, 1, 0, nx2, ny2, 1, 1, nx1, ny1, 0, 0, nx2, ny2, 1, 1, nx1, ny2, 0, 1 };
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(rv), rv);
         glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Cleanup temp resources
-        glDeleteTextures(1, &tempZoomTexture);
-        glDeleteFramebuffers(1, &tempZoomFBO);
     } else {
         // Full opacity - use original direct rendering path
         glDisable(GL_BLEND);
@@ -1815,9 +1815,9 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
         if (useSnapshot) {
             // Transitioning FROM EyeZoom - use the cached snapshot
             // The snapshot contains the complete zoom output from the last EyeZoom frame
-            GLuint tempFBO = 0;
-            glGenFramebuffers(1, &tempFBO);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, tempFBO);
+            // PERF: Reuse cached blit FBO instead of creating/destroying every frame
+            if (s_eyeZoomBlitFBO == 0) { glGenFramebuffers(1, &s_eyeZoomBlitFBO); }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, s_eyeZoomBlitFBO);
             glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_eyeZoomSnapshotTexture, 0);
 
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -1825,23 +1825,19 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
             // Blit entire snapshot to destination (snapshot is already the right content)
             glBlitFramebuffer(0, 0, s_eyeZoomSnapshotWidth, s_eyeZoomSnapshotHeight, dstLeft, dstBottom, dstRight, dstTop,
                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-            glDeleteFramebuffers(1, &tempFBO);
         } else {
             // Stable or transitioning TO EyeZoom - use live game texture
             // Also capture to snapshot for future transition-out
 
             // First, render to screen from game texture
-            GLuint tempFBO = 0;
-            glGenFramebuffers(1, &tempFBO);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, tempFBO);
+            // PERF: Reuse cached blit FBO instead of creating/destroying every frame
+            if (s_eyeZoomBlitFBO == 0) { glGenFramebuffers(1, &s_eyeZoomBlitFBO); }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, s_eyeZoomBlitFBO);
             glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gameTextureToUse, 0);
 
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 
             glBlitFramebuffer(srcLeft, srcBottom, srcRight, srcTop, dstLeft, dstBottom, dstRight, dstTop, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-            glDeleteFramebuffers(1, &tempFBO);
 
             // Now capture the zoom output to snapshot texture for future use
             // Create or resize snapshot texture if needed
@@ -1894,36 +1890,49 @@ void handleEyeZoomMode(const GLState& s, float opacity, int animatedViewportX) {
             boxHeight = static_cast<float>(zoomConfig.rectHeight);
         }
 
+        // PERF: Batch all overlay boxes into two groups (even/odd color) for 2 draw calls instead of N
+        std::vector<float> evenVerts, oddVerts;
+        evenVerts.reserve(overlayLabelsPerSide * 6 * 4);
+        oddVerts.reserve(overlayLabelsPerSide * 6 * 4);
+
         for (int xOffset = -overlayLabelsPerSide; xOffset <= overlayLabelsPerSide; xOffset++) {
             if (xOffset == 0) continue;
 
-            // Map xOffset (relative to center) to the full clone column index [0..cloneWidth-1]
             int boxIndex = xOffset + labelsPerSide - (xOffset > 0 ? 1 : 0);
             float boxLeft = zoomX + (boxIndex * pixelWidthOnScreen);
             float boxRight = boxLeft + pixelWidthOnScreen;
             float boxBottom = centerY - boxHeight / 2.0f;
             float boxTop = centerY + boxHeight / 2.0f;
 
-            Color boxColor = (boxIndex % 2 == 0) ? zoomConfig.gridColor1 : zoomConfig.gridColor2;
-            float boxOpacity = (boxIndex % 2 == 0) ? zoomConfig.gridColor1Opacity : zoomConfig.gridColor2Opacity;
-            glUniform4f(g_solidColorShaderLocs.color, boxColor.r, boxColor.g, boxColor.b, boxOpacity);
-
             float boxNdcLeft = (boxLeft / (float)fullW) * 2.0f - 1.0f;
             float boxNdcRight = (boxRight / (float)fullW) * 2.0f - 1.0f;
             float boxNdcBottom = (boxBottom / (float)fullH) * 2.0f - 1.0f;
             float boxNdcTop = (boxTop / (float)fullH) * 2.0f - 1.0f;
 
-            float boxVerts[] = {
+            auto& verts = (boxIndex % 2 == 0) ? evenVerts : oddVerts;
+            float quad[] = {
                 boxNdcLeft, boxNdcBottom, 0, 0, boxNdcRight, boxNdcBottom, 0, 0, boxNdcRight, boxNdcTop, 0, 0,
                 boxNdcLeft, boxNdcBottom, 0, 0, boxNdcRight, boxNdcTop,    0, 0, boxNdcLeft,  boxNdcTop, 0, 0,
             };
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(boxVerts), boxVerts);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+            verts.insert(verts.end(), std::begin(quad), std::end(quad));
 
             int displayNumber = abs(xOffset);
             float numberCenterX = boxLeft + pixelWidthOnScreen / 2.0f;
             float numberCenterY = centerY;
             CacheEyeZoomTextLabel(displayNumber, numberCenterX, numberCenterY, zoomConfig.textColor);
+        }
+
+        // Draw even-index boxes
+        if (!evenVerts.empty()) {
+            glUniform4f(g_solidColorShaderLocs.color, zoomConfig.gridColor1.r, zoomConfig.gridColor1.g, zoomConfig.gridColor1.b, zoomConfig.gridColor1Opacity);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, evenVerts.size() * sizeof(float), evenVerts.data());
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(evenVerts.size() / 4));
+        }
+        // Draw odd-index boxes
+        if (!oddVerts.empty()) {
+            glUniform4f(g_solidColorShaderLocs.color, zoomConfig.gridColor2.r, zoomConfig.gridColor2.g, zoomConfig.gridColor2.b, zoomConfig.gridColor2Opacity);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, oddVerts.size() * sizeof(float), oddVerts.data());
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(oddVerts.size() / 4));
         }
 
         // STEP 3: Render vertical center line
@@ -1979,6 +1988,9 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
         fullW = GetCachedScreenWidth();
         fullH = GetCachedScreenHeight();
     }
+
+    // Single config snapshot for the entire frame - avoids repeated mutex acquisition
+    auto configSnap = GetConfigSnapshot();
 
     // Get all animated state atomically to avoid race conditions
     ModeTransitionState transitionState;
@@ -2473,56 +2485,60 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
 
             // Collect active mirrors for fallback rendering (use snapshot for thread safety)
             std::vector<MirrorConfig> fallbackMirrors;
-            auto fallbackSnap = GetConfigSnapshot();
-            const auto& fbMirrors = fallbackSnap ? fallbackSnap->mirrors : g_config.mirrors; // snapshot preferred
-            const auto& fbGroups = fallbackSnap ? fallbackSnap->mirrorGroups : g_config.mirrorGroups;
+            const auto& fbMirrors = configSnap ? configSnap->mirrors : g_config.mirrors; // snapshot preferred
+            const auto& fbGroups = configSnap ? configSnap->mirrorGroups : g_config.mirrorGroups;
             fallbackMirrors.reserve(modeToRender->mirrorIds.size() + modeToRender->mirrorGroupIds.size());
+
+            // Build O(1) lookup maps to avoid O(n²) nested loops
+            std::unordered_map<std::string, size_t> mirrorIndex;
+            mirrorIndex.reserve(fbMirrors.size());
+            for (size_t i = 0; i < fbMirrors.size(); ++i) { mirrorIndex[fbMirrors[i].name] = i; }
+            std::unordered_map<std::string, size_t> groupIndex;
+            groupIndex.reserve(fbGroups.size());
+            for (size_t i = 0; i < fbGroups.size(); ++i) { groupIndex[fbGroups[i].name] = i; }
+
             for (const auto& name : modeToRender->mirrorIds) {
-                for (const auto& mirror : fbMirrors) {
-                    if (mirror.name == name) {
-                        fallbackMirrors.push_back(mirror);
-                        break;
-                    }
+                auto it = mirrorIndex.find(name);
+                if (it != mirrorIndex.end()) {
+                    fallbackMirrors.push_back(fbMirrors[it->second]);
                 }
             }
             for (const auto& groupName : modeToRender->mirrorGroupIds) {
-                for (const auto& group : fbGroups) {
-                    if (group.name == groupName) {
-                        for (const auto& item : group.mirrors) {
-                            if (!item.enabled) continue; // Skip disabled items
-                            for (const auto& mirror : fbMirrors) {
-                                if (mirror.name == item.mirrorId) {
-                                    MirrorConfig groupedMirror = mirror;
-                                    // Calculate group position - use relative percentages if enabled
-                                    int groupX = group.output.x;
-                                    int groupY = group.output.y;
-                                    if (group.output.useRelativePosition) {
-                                        int screenW = GetCachedScreenWidth();
-                                        int screenH = GetCachedScreenHeight();
-                                        groupX = static_cast<int>(group.output.relativeX * screenW);
-                                        groupY = static_cast<int>(group.output.relativeY * screenH);
-                                    }
-                                    // Position from group + per-item offset
-                                    groupedMirror.output.x = groupX + item.offsetX;
-                                    groupedMirror.output.y = groupY + item.offsetY;
-                                    groupedMirror.output.relativeTo = group.output.relativeTo;
-                                    groupedMirror.output.useRelativePosition = group.output.useRelativePosition;
-                                    groupedMirror.output.relativeX = group.output.relativeX;
-                                    groupedMirror.output.relativeY = group.output.relativeY;
-                                    // Per-item sizing
-                                    if (item.widthPercent != 1.0f || item.heightPercent != 1.0f) {
-                                        groupedMirror.output.separateScale = true;
-                                        float baseScaleX = mirror.output.separateScale ? mirror.output.scaleX : mirror.output.scale;
-                                        float baseScaleY = mirror.output.separateScale ? mirror.output.scaleY : mirror.output.scale;
-                                        groupedMirror.output.scaleX = baseScaleX * item.widthPercent;
-                                        groupedMirror.output.scaleY = baseScaleY * item.heightPercent;
-                                    }
-                                    fallbackMirrors.push_back(groupedMirror);
-                                    break;
-                                }
+                auto git = groupIndex.find(groupName);
+                if (git != groupIndex.end()) {
+                    const auto& group = fbGroups[git->second];
+                    for (const auto& item : group.mirrors) {
+                        if (!item.enabled) continue; // Skip disabled items
+                        auto mit = mirrorIndex.find(item.mirrorId);
+                        if (mit != mirrorIndex.end()) {
+                            const auto& mirror = fbMirrors[mit->second];
+                            MirrorConfig groupedMirror = mirror;
+                            // Calculate group position - use relative percentages if enabled
+                            int groupX = group.output.x;
+                            int groupY = group.output.y;
+                            if (group.output.useRelativePosition) {
+                                int screenW = GetCachedScreenWidth();
+                                int screenH = GetCachedScreenHeight();
+                                groupX = static_cast<int>(group.output.relativeX * screenW);
+                                groupY = static_cast<int>(group.output.relativeY * screenH);
                             }
+                            // Position from group + per-item offset
+                            groupedMirror.output.x = groupX + item.offsetX;
+                            groupedMirror.output.y = groupY + item.offsetY;
+                            groupedMirror.output.relativeTo = group.output.relativeTo;
+                            groupedMirror.output.useRelativePosition = group.output.useRelativePosition;
+                            groupedMirror.output.relativeX = group.output.relativeX;
+                            groupedMirror.output.relativeY = group.output.relativeY;
+                            // Per-item sizing
+                            if (item.widthPercent != 1.0f || item.heightPercent != 1.0f) {
+                                groupedMirror.output.separateScale = true;
+                                float baseScaleX = mirror.output.separateScale ? mirror.output.scaleX : mirror.output.scale;
+                                float baseScaleY = mirror.output.separateScale ? mirror.output.scaleY : mirror.output.scale;
+                                groupedMirror.output.scaleX = baseScaleX * item.widthPercent;
+                                groupedMirror.output.scaleY = baseScaleY * item.heightPercent;
+                            }
+                            fallbackMirrors.push_back(groupedMirror);
                         }
-                        break;
                     }
                 }
             }
@@ -2683,8 +2699,7 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
 
                     // Check which image is under the mouse cursor (use snapshot for safe iteration)
                     std::string hoveredImage = "";
-                    auto dragSnap = GetConfigSnapshot();
-                    const auto& dragImages = dragSnap ? dragSnap->images : std::vector<ImageConfig>{};
+                    const auto& dragImages = configSnap ? configSnap->images : std::vector<ImageConfig>{};
                     for (const auto& imageName : modeToRender->imageIds) {
                         // Look up image config by name from snapshot
                         const ImageConfig* confPtr = nullptr;
@@ -2803,11 +2818,10 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
                         if (cacheLock.owns_lock()) {
                             // Reset to defaults - will be updated if we find a hovered overlay
                             hoveredOverlay = ""; // Build list of active window overlays with their configs
-                            auto overlayDragSnap = GetConfigSnapshot();
                             std::vector<std::pair<std::string, WindowOverlayConfig>> activeOverlays;
                             for (const auto& overlayId : modeToRender->windowOverlayIds) {
                                 const WindowOverlayConfig* config =
-                                    overlayDragSnap ? FindWindowOverlayConfigIn(overlayId, *overlayDragSnap) : nullptr;
+                                    configSnap ? FindWindowOverlayConfigIn(overlayId, *configSnap) : nullptr;
                                 if (config) { activeOverlays.push_back({ overlayId, *config }); }
                             }
 
@@ -2841,9 +2855,8 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
                         s_lastMousePos = mousePos;
 
                         // Read initial position from snapshot for thread safety
-                        auto startSnap = GetConfigSnapshot();
-                        if (startSnap) {
-                            for (const auto& overlay : startSnap->windowOverlays) {
+                        if (configSnap) {
+                            for (const auto& overlay : configSnap->windowOverlays) {
                                 if (overlay.name == s_draggedWindowOverlayName) {
                                     s_initialX = overlay.x;
                                     s_initialY = overlay.y;
@@ -2968,6 +2981,9 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
             }
 
             // Populate ImGui rendering state from global atomics
+            // Acquire isTransitioningFromEyeZoom first - it's the release-paired store,
+            // so acquiring it guarantees all other EyeZoom stores are visible
+            request.isTransitioningFromEyeZoom = g_isTransitioningFromEyeZoom.load(std::memory_order_acquire);
             request.shouldRenderGui = g_shouldRenderGui.load(std::memory_order_relaxed);
             request.showPerformanceOverlay = g_showPerformanceOverlay.load(std::memory_order_relaxed);
             request.showProfiler = g_showProfiler.load(std::memory_order_relaxed);
@@ -2976,7 +2992,6 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
             // When hideAnimationsInGame is enabled, use static position (-1) for EyeZoom on user's screen
             // OBS request (via BuildObsFrameRequest) still gets the animated position
             request.eyeZoomAnimatedViewportX = skipAnimation ? -1 : g_eyeZoomAnimatedViewportX.load(std::memory_order_relaxed);
-            request.isTransitioningFromEyeZoom = g_isTransitioningFromEyeZoom.load(std::memory_order_relaxed);
             request.eyeZoomSnapshotTexture = GetEyeZoomSnapshotTexture();
             request.eyeZoomSnapshotWidth = GetEyeZoomSnapshotWidth();
             request.eyeZoomSnapshotHeight = GetEyeZoomSnapshotHeight();
@@ -3249,7 +3264,8 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
     int screenH = GetCachedScreenHeight();
 
     // Find all valid textures, filtering by dimensions and format
-    std::vector<GLuint> validTextures;
+    struct TexInfo { GLuint id; GLint width; GLint height; GLint internalFormat; };
+    std::vector<TexInfo> validTextures;
     for (GLuint id = 0; id <= MAX_TEXTURE_ID; id++) {
         if (glIsTexture(id)) {
             glBindTexture(GL_TEXTURE_2D, id);
@@ -3258,15 +3274,14 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
             glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &texHeight);
             glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internalFormat);
 
-            // Log("Found texture ID " + std::to_string(id) + " - " + "Width: " + std::to_string(texWidth) +
-            //     ", Height: " + std::to_string(texHeight) + ", Internal Format: " + std::to_string(internalFormat));
-
             // If mode dimensions are specified, only include matching textures with GL_RGBA8 format
             if (modeWidth > 0 && modeHeight > 0) {
-                if (texWidth == modeWidth && texHeight == modeHeight && internalFormat == GL_RGBA8) { validTextures.push_back(id); }
+                if (texWidth == modeWidth && texHeight == modeHeight && internalFormat == GL_RGBA8) {
+                    validTextures.push_back({ id, texWidth, texHeight, internalFormat });
+                }
             } else {
                 // No mode dimensions specified, include all textures
-                validTextures.push_back(id);
+                validTextures.push_back({ id, texWidth, texHeight, internalFormat });
             }
         }
     }
@@ -3322,20 +3337,19 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
     // Render each texture showing its actual content
     int col = 0;
     int row = 0;
-    for (GLuint texId : validTextures) {
+    for (const auto& tex : validTextures) {
         int x = MARGIN + col * (TILE_SIZE + PADDING);
         int y = MARGIN + row * (TILE_SIZE + PADDING);
 
         // Bind the texture to display
-        glBindTexture(GL_TEXTURE_2D, texId);
+        glBindTexture(GL_TEXTURE_2D, tex.id);
 
-        // Query texture dimensions and format
-        GLint texWidth = 0, texHeight = 0, internalFormat = 0;
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &texWidth);
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &texHeight);
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internalFormat);
+        // Use cached dimensions from first pass (avoid redundant glGetTexLevelParameteriv)
+        GLint texWidth = tex.width;
+        GLint texHeight = tex.height;
+        GLint internalFormat = tex.internalFormat;
 
-        // Query texture parameters
+        // Query texture parameters (these weren't cached in first pass)
         GLint minFilter = 0, magFilter = 0, wrapS = 0, wrapT = 0;
         glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minFilter);
         glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magFilter);
@@ -3348,7 +3362,7 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
         // Cache position, dimensions, and debug info for text rendering later (during ImGui frame)
         {
             std::lock_guard<std::mutex> lock(s_textureGridMutex);
-            s_textureGridLabels.push_back({ texId, (float)x, (float)y, TILE_SIZE, texWidth, texHeight, sizeMB, (GLenum)internalFormat,
+            s_textureGridLabels.push_back({ tex.id, (float)x, (float)y, TILE_SIZE, texWidth, texHeight, sizeMB, (GLenum)internalFormat,
                                             minFilter, magFilter, wrapS, wrapT });
         }
 
@@ -3356,7 +3370,7 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
         // GLint minFilter, magFilter;
         // glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minFilter);
         // glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magFilter);
-        texFilterStates[texId] = { minFilter, magFilter };
+        texFilterStates[tex.id] = { minFilter, magFilter };
 
         // Set texture filtering for preview
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -3390,13 +3404,6 @@ void RenderTextureGridOverlay(bool showTextureGrid, int modeWidth, int modeHeigh
             col = 0;
             row++;
         }
-    }
-
-    // Restore filter state for all modified textures
-    for (const auto& pair : texFilterStates) {
-        glBindTexture(GL_TEXTURE_2D, pair.first);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, pair.second.first);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, pair.second.second);
     }
 
     // Restore filter state for all modified textures

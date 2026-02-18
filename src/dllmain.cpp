@@ -1379,12 +1379,17 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
                 PROFILE_SCOPE_CAT("Calculate Game Texture ID", "SwapBuffers");
                 gameTextureId = CalculateGameTextureId(windowWidth, windowHeight, fullW, fullH);
             }
-            if (gameTextureId == UINT_MAX) {
-                // Log("Game texture ID not found yet, deferring to next frame");
-                // return owglSwapBuffers(hDc);
+            if (gameTextureId != UINT_MAX) {
+                g_cachedGameTextureId.store(gameTextureId);
+                Log("Calculated game texture ID: " + std::to_string(gameTextureId));
             }
-            g_cachedGameTextureId.store(gameTextureId);
-            Log("Calculated game texture ID: " + std::to_string(g_cachedGameTextureId.load()));
+            // If texture not found, leave g_cachedGameTextureId as UINT_MAX.
+            // This will retry next frame. We do NOT store UINT_MAX explicitly -
+            // it's already UINT_MAX and storing it again would be redundant.
+            // Previously this was unconditionally storing UINT_MAX which is fine,
+            // but the real fix is that we continue rendering with whatever the
+            // render thread has (ready frame / safe read texture fallback) rather
+            // than stalling the pipeline.
         }
 
         // Note: Windows mouse speed application is now handled by the logic thread
@@ -1876,7 +1881,8 @@ void main() {
         g_showEyeZoom.store(showEyeZoomOnScreen, std::memory_order_relaxed);
         g_eyeZoomFadeOpacity.store(1.0f, std::memory_order_relaxed); // Always full opacity - bounce, not fade
         g_eyeZoomAnimatedViewportX.store(eyeZoomAnimatedViewportX, std::memory_order_relaxed);
-        g_isTransitioningFromEyeZoom.store(isTransitioningFromEyeZoom, std::memory_order_relaxed);
+        // Release ensures all preceding EyeZoom stores are visible when the reader acquires this value
+        g_isTransitioningFromEyeZoom.store(isTransitioningFromEyeZoom, std::memory_order_release);
 
         if (!g_glInitialized) {
             PROFILE_SCOPE_CAT("GPU Resource Init Check", "SwapBuffers");
