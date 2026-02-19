@@ -1884,14 +1884,18 @@ bool LoadConfigFromTomlFile(const std::wstring& path, Config& config) {
             return false;
         }
 
+        toml::table tbl;
+#if TOML_EXCEPTIONS
+        tbl = toml::parse(in, path);
+#else
         toml::parse_result result = toml::parse(in, path);
         if (!result) {
             const auto& err = result.error();
             Log("ERROR: TOML parse error: " + std::string(err.description()));
             return false;
         }
-
-        toml::table tbl = std::move(result).table();
+        tbl = std::move(result).table();
+#endif
         ConfigFromToml(tbl, config);
         return true;
     } catch (const std::exception& e) {

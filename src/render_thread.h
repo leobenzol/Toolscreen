@@ -218,12 +218,12 @@ GLsync GetCompletedObsFence();
 // --- Helper for building OBS frame requests ---
 // Provides shared OBS context data to avoid repetition in dllmain.cpp
 struct ObsFrameContext {
-    int fullW, fullH;
-    int gameW, gameH;
-    GLuint gameTextureId;
+    int fullW = 0, fullH = 0;
+    int gameW = 0, gameH = 0;
+    GLuint gameTextureId = 0;
     std::string modeId;
-    bool relativeStretching;
-    float bgR, bgG, bgB;
+    bool relativeStretching = false;
+    float bgR = 0.0f, bgG = 0.0f, bgB = 0.0f;
 
     // Windowed mode support (for virtual camera centering)
     bool isWindowed = false;        // True when game is not fullscreen
@@ -232,16 +232,16 @@ struct ObsFrameContext {
     int windowH = 0;                // Actual game window height
 
     // GUI state
-    bool shouldRenderGui;
-    bool showPerformanceOverlay;
-    bool showProfiler;
-    bool isEyeZoom;
-    bool isTransitioningFromEyeZoom;
-    int eyeZoomAnimatedViewportX;
-    GLuint eyeZoomSnapshotTexture;
-    int eyeZoomSnapshotWidth;
-    int eyeZoomSnapshotHeight;
-    bool showTextureGrid;
+    bool shouldRenderGui = false;
+    bool showPerformanceOverlay = false;
+    bool showProfiler = false;
+    bool isEyeZoom = false;
+    bool isTransitioningFromEyeZoom = false;
+    int eyeZoomAnimatedViewportX = 0;
+    GLuint eyeZoomSnapshotTexture = 0;
+    int eyeZoomSnapshotWidth = 0;
+    int eyeZoomSnapshotHeight = 0;
+    bool showTextureGrid = false;
 
     // Welcome toast (shown briefly after DLL injection)
     bool showWelcomeToast = false;

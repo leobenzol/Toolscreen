@@ -1670,13 +1670,18 @@ void LoadTheme() {
         return;
     }
     try {
+        toml::table tbl;
+#if TOML_EXCEPTIONS
+        tbl = toml::parse(testFile, themePath);
+#else
         toml::parse_result result = toml::parse(testFile, themePath);
         if (!result) {
             const auto& err = result.error();
             Log("ERROR: Failed to parse theme.toml: " + std::string(err.description()));
             return;
         }
-        toml::table tbl = std::move(result).table();
+        tbl = std::move(result).table();
+#endif
         if (tbl.contains("theme")) {
             std::string themeName = tbl["theme"].value_or<std::string>("Dark");
             g_config.appearance.theme = themeName;
@@ -1846,12 +1851,18 @@ void LoadConfig() {
         if (!in.is_open()) {
             throw std::runtime_error("Failed to open config.toml for reading.");
         }
+
+        toml::table tbl;
+    #if TOML_EXCEPTIONS
+        tbl = toml::parse(in, configPath);
+    #else
         toml::parse_result result = toml::parse(in, configPath);
         if (!result) {
             const auto& err = result.error();
             throw std::runtime_error(std::string(err.description()));
         }
-        toml::table tbl = std::move(result).table();
+        tbl = std::move(result).table();
+    #endif
         ConfigFromToml(tbl, g_config);
         Log("Loaded config from TOML file.");
 

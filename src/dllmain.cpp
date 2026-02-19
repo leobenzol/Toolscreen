@@ -2554,6 +2554,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         HMODULE hUser32 = GetModuleHandle(L"user32.dll");
         HMODULE hGlfw = GetModuleHandle(L"glfw.dll");
 
+        if (!hOpenGL32) {
+            Log("ERROR: GetModuleHandle(opengl32.dll) returned NULL");
+            return TRUE;
+        }
+        if (!hUser32) {
+            Log("ERROR: GetModuleHandle(user32.dll) returned NULL");
+            return TRUE;
+        }
+
 // Create all hooks
 #define HOOK(mod, name) CreateHookOrDie(GetProcAddress(mod, #name), &hk##name, &o##name, #name)
         HOOK(hOpenGL32, wglSwapBuffers);
@@ -2567,7 +2576,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         HOOK(hUser32, ClipCursor);
         HOOK(hUser32, SetCursor);
         HOOK(hUser32, GetRawInputData);
-        HOOK(hGlfw, glfwSetInputMode);
+        if (hGlfw) {
+            HOOK(hGlfw, glfwSetInputMode);
+        } else {
+            LogCategory("init", "WARNING: glfw.dll not loaded; skipping glfwSetInputMode hook");
+        }
 #undef HOOK
 
         // glBlitNamedFramebuffer is an extension, try to hook it but don't fail if unavailable
