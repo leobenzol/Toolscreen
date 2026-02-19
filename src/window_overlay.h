@@ -64,7 +64,7 @@ struct WindowOverlayCacheEntry {
     std::string windowClass;
     std::string executableName;
     std::string windowMatchPriority = "title";
-    HWND targetWindow = NULL;
+    std::atomic<HWND> targetWindow{ NULL };
 
     // Cached bitmap data (capture thread only)
     HBITMAP hBitmap = NULL;

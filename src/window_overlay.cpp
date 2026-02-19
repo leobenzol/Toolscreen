@@ -88,6 +88,14 @@ HWND FindWindowByTitleAndClass(const std::string& title, const std::string& clas
         [](HWND hwnd, LPARAM lParam) -> BOOL {
             EnumData* data = reinterpret_cast<EnumData*>(lParam);
 
+            // Prevent recursive/self capture: never target our own game window (or any window owned by this process).
+            // Toolscreen runs injected, so "this process" is the game process.
+            HWND gameHwnd = g_minecraftHwnd.load(std::memory_order_relaxed);
+            if (gameHwnd && hwnd == gameHwnd) { return TRUE; }
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != 0 && pid == GetCurrentProcessId()) { return TRUE; }
+
             // Skip invisible windows
             if (!IsWindowVisible(hwnd)) { return TRUE; }
 
@@ -199,10 +207,11 @@ static void LoadWindowOverlay_Internal(const std::string& overlayId, const Windo
         if (windowChanged) {
             // Keep the current render buffer visible while we capture the new window
             // Don't reset lastUploadedRenderData - let the new capture naturally update it
-            entry->targetWindow =
-                FindWindowByTitleAndClass(config.windowTitle, config.windowClass, config.executableName, config.windowMatchPriority);
+            entry->targetWindow.store(
+                FindWindowByTitleAndClass(config.windowTitle, config.windowClass, config.executableName, config.windowMatchPriority),
+                std::memory_order_relaxed);
 
-            if (entry->targetWindow) {
+            if (entry->targetWindow.load(std::memory_order_relaxed)) {
                 Log("Updated target window for overlay '" + overlayId + "': " + config.windowTitle);
             } else {
                 Log("Warning: Could not find target window for overlay '" + overlayId + "': " + config.windowTitle);
@@ -223,10 +232,11 @@ static void LoadWindowOverlay_Internal(const std::string& overlayId, const Windo
     entry->needsUpdate.store(true, std::memory_order_relaxed);
 
     // Find the target window
-    entry->targetWindow =
-        FindWindowByTitleAndClass(config.windowTitle, config.windowClass, config.executableName, config.windowMatchPriority);
+    entry->targetWindow.store(
+        FindWindowByTitleAndClass(config.windowTitle, config.windowClass, config.executableName, config.windowMatchPriority),
+        std::memory_order_relaxed);
 
-    if (entry->targetWindow) {
+    if (entry->targetWindow.load(std::memory_order_relaxed)) {
         Log("Found target window for overlay '" + overlayId + "': " + config.windowTitle);
     } else {
         Log("Warning: Could not find target window for overlay '" + overlayId + "': " + config.windowTitle);
@@ -263,23 +273,26 @@ void UpdateAllWindowOverlays() {
     auto now = std::chrono::steady_clock::now();
 
     for (auto& [overlayId, entry] : g_windowOverlayCache) {
+        HWND target = entry->targetWindow.load(std::memory_order_relaxed);
         // Check if the window is still valid
-        if (entry->targetWindow && !IsWindow(entry->targetWindow)) {
-            entry->targetWindow = NULL;
+        if (target && !IsWindow(target)) {
+            entry->targetWindow.store(NULL, std::memory_order_relaxed);
             entry->lastSearchTime = now; // Reset search timer when window is lost
+            target = NULL;
         }
 
         // Try to find window again if we lost it, respecting the search interval
-        if (!entry->targetWindow) {
+        if (!target) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - entry->lastSearchTime);
             int interval = entry->searchInterval.load(std::memory_order_relaxed);
 
             if (elapsed.count() >= interval) {
-                entry->targetWindow =
+                HWND found =
                     FindWindowByTitleAndClass(entry->windowTitle, entry->windowClass, entry->executableName, entry->windowMatchPriority);
+                entry->targetWindow.store(found, std::memory_order_relaxed);
                 entry->lastSearchTime = now;
 
-                if (entry->targetWindow) {
+                if (found) {
                     Log("Reacquired target window for overlay '" + overlayId + "'");
                     entry->needsUpdate.store(true, std::memory_order_relaxed);
                 }
@@ -347,7 +360,10 @@ void UpdateWindowOverlay(const std::string& overlayId) {
     WindowOverlayCacheEntry& entry = *it->second;
 
     // Check if the window is still valid (fast check, no enumeration)
-    if (entry.targetWindow && !IsWindow(entry.targetWindow)) { entry.targetWindow = NULL; }
+    {
+        HWND target = entry.targetWindow.load(std::memory_order_relaxed);
+        if (target && !IsWindow(target)) { entry.targetWindow.store(NULL, std::memory_order_relaxed); }
+    }
 
     // Mark for update - the background thread will find the window
     // This avoids expensive window enumeration on the render thread
@@ -359,7 +375,30 @@ void UpdateWindowOverlay(const std::string& overlayId) {
 bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayConfig& config) {
     std::lock_guard<std::mutex> lock(entry.captureMutex);
 
-    if (!entry.targetWindow || !IsWindow(entry.targetWindow) || !IsWindowVisible(entry.targetWindow)) { return false; }
+    HWND targetHwnd = entry.targetWindow.load(std::memory_order_relaxed);
+    if (!targetHwnd || !IsWindow(targetHwnd) || !IsWindowVisible(targetHwnd)) { return false; }
+
+    // Prevent recursive/self capture even if config was manually edited to target our own window.
+    {
+        HWND gameHwnd = g_minecraftHwnd.load(std::memory_order_relaxed);
+        if (gameHwnd && targetHwnd == gameHwnd) {
+            Log("[WindowOverlay] Refusing to capture the game window (self-capture). Clearing target.");
+            entry.targetWindow.store(NULL, std::memory_order_relaxed);
+            entry.needsUpdate.store(true, std::memory_order_relaxed);
+            entry.lastSearchTime = std::chrono::steady_clock::now() - std::chrono::seconds(100);
+            return false;
+        }
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(targetHwnd, &pid);
+        if (pid != 0 && pid == GetCurrentProcessId()) {
+            Log("[WindowOverlay] Refusing to capture a same-process window (self-capture). Clearing target.");
+            entry.targetWindow.store(NULL, std::memory_order_relaxed);
+            entry.needsUpdate.store(true, std::memory_order_relaxed);
+            entry.lastSearchTime = std::chrono::steady_clock::now() - std::chrono::seconds(100);
+            return false;
+        }
+    }
 
     // Check FPS throttling
     auto now = std::chrono::steady_clock::now();
@@ -373,11 +412,12 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
     entry.lastCaptureTime = now;
     entry.needsUpdate.store(false, std::memory_order_relaxed);
 
-    if (!entry.targetWindow || !IsWindow(entry.targetWindow)) { return false; }
+    targetHwnd = entry.targetWindow.load(std::memory_order_relaxed);
+    if (!targetHwnd || !IsWindow(targetHwnd)) { return false; }
 
     // Get window dimensions using client area for more accurate capture
     RECT clientRect;
-    if (!GetClientRect(entry.targetWindow, &clientRect)) { return false; }
+    if (!GetClientRect(targetHwnd, &clientRect)) { return false; }
 
     int windowWidth = clientRect.right - clientRect.left;
     int windowHeight = clientRect.bottom - clientRect.top;
@@ -429,9 +469,9 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
 
     // Check if window is cloaked (hidden/minimized) or iconic (minimized) using DWM
     BOOL isCloaked = FALSE;
-    HRESULT hr = DwmGetWindowAttribute(entry.targetWindow, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
+    HRESULT hr = DwmGetWindowAttribute(targetHwnd, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
     bool windowIsCloaked = SUCCEEDED(hr) && isCloaked;
-    bool windowIsIconic = IsIconic(entry.targetWindow);
+    bool windowIsIconic = IsIconic(targetHwnd);
 
     // Determine if we should avoid PrintWindow (though PrintWindow itself is fine)
     // We avoid it for cloaked/iconic windows since they may not render properly
@@ -445,7 +485,7 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
     if (config.captureMethod == "BitBlt") {
         // BitBlt method: Captures from window DC with source offset
         // Note: BitBlt requires GetDC which CAN cause flicker on some windows
-        hdcWindow = GetDC(entry.targetWindow);
+        hdcWindow = GetDC(targetHwnd);
         if (hdcWindow) { result = BitBlt(hdcMem, 0, 0, captureWidth, captureHeight, hdcWindow, cropLeft, cropTop, SRCCOPY); }
     } else {
         // Windows 10+ method (default): Uses PrintWindow with PW_RENDERFULLCONTENT
@@ -465,7 +505,7 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
                         HBITMAP hOldFullBitmap = (HBITMAP)SelectObject(hdcFullMem, hFullBitmap);
 
                         // Capture the full window
-                        result = PrintWindow(entry.targetWindow, hdcFullMem, PW_RENDERFULLCONTENT);
+                        result = PrintWindow(targetHwnd, hdcFullMem, PW_RENDERFULLCONTENT);
 
                         if (result) {
                             // Copy only the cropped region to our output bitmap
@@ -480,13 +520,13 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
                 }
             } else {
                 // No cropping needed, capture directly to our output bitmap
-                result = PrintWindow(entry.targetWindow, hdcMem, PW_RENDERFULLCONTENT);
+                result = PrintWindow(targetHwnd, hdcMem, PW_RENDERFULLCONTENT);
                 usedPrintWindow = true;
             }
         }
         // Fall back to BitBlt only if PrintWindow fails or was avoided
         if (!result) {
-            hdcWindow = GetDC(entry.targetWindow);
+            hdcWindow = GetDC(targetHwnd);
             if (hdcWindow) { result = BitBlt(hdcMem, 0, 0, captureWidth, captureHeight, hdcWindow, cropLeft, cropTop, SRCCOPY); }
         }
     }
@@ -516,7 +556,7 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
             SelectObject(hdcMem, hOldBitmap);
             DeleteObject(hBitmap);
             DeleteDC(hdcMem);
-            if (hdcWindow) { ReleaseDC(entry.targetWindow, hdcWindow); }
+            if (hdcWindow) { ReleaseDC(targetHwnd, hdcWindow); }
             ReleaseDC(NULL, hdcScreen);
             return false;
         }
@@ -614,7 +654,7 @@ bool CaptureWindowContent(WindowOverlayCacheEntry& entry, const WindowOverlayCon
     SelectObject(hdcMem, hOldBitmap);
     DeleteObject(hBitmap);
     DeleteDC(hdcMem);
-    if (hdcWindow) { ReleaseDC(entry.targetWindow, hdcWindow); }
+    if (hdcWindow) { ReleaseDC(targetHwnd, hdcWindow); }
     ReleaseDC(NULL, hdcScreen);
 
     // If Windows 10+ method failed and capture failed, show error texture
@@ -863,7 +903,7 @@ std::string GetWindowOverlayAtPoint(int x, int y, int screenWidth, int screenHei
 HWND GetWindowOverlayHWND(const std::string& overlayName) {
     std::lock_guard<std::mutex> lock(g_windowOverlayCacheMutex);
     auto it = g_windowOverlayCache.find(overlayName);
-    if (it != g_windowOverlayCache.end() && it->second) { return it->second->targetWindow; }
+    if (it != g_windowOverlayCache.end() && it->second) { return it->second->targetWindow.load(std::memory_order_relaxed); }
     return NULL;
 }
 
@@ -1143,6 +1183,14 @@ std::string GetExecutableNameFromWindow(HWND hwnd) {
 
 BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam) {
     std::vector<WindowInfo>* windows = reinterpret_cast<std::vector<WindowInfo>*>(lParam);
+
+    // Prevent selecting our own game window / helper windows as capture targets.
+    // Since Toolscreen is injected, windows owned by this process are the game (and any of our helpers).
+    HWND gameHwnd = g_minecraftHwnd.load(std::memory_order_relaxed);
+    if (gameHwnd && hwnd == gameHwnd) { return TRUE; }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != 0 && pid == GetCurrentProcessId()) { return TRUE; }
 
     // Skip invisible windows
     if (!IsWindowVisible(hwnd)) { return TRUE; }
