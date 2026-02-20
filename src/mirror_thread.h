@@ -31,6 +31,12 @@ extern std::atomic<bool> g_safeToCapture;
 // avoid doing expensive full-frame GPU copies when nothing consumes them.
 extern std::atomic<int> g_activeMirrorCaptureCount;
 
+// Maximum requested FPS among active mirrors (summary of ThreadedMirrorConfig::fps).
+// - 0 means "unlimited" (at least one mirror has fps <= 0) OR "no mirrors" when count==0.
+// - >0 means captures for mirror-only consumption can be rate-limited to this FPS.
+// Updated by UpdateMirrorCaptureConfigs() and UpdateMirrorFPS(); read by SwapBuffers hook.
+extern std::atomic<int> g_activeMirrorCaptureMaxFps;
+
 // Named ThreadedMirrorConfig to avoid conflict with MirrorCaptureConfig in gui.h
 struct ThreadedMirrorConfig {
     std::string name;

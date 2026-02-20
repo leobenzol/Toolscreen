@@ -1394,10 +1394,42 @@ static BOOL SwapBuffersHook_Impl(WGLSWAPBUFFERS next, HDC hDc) {
 
             const bool needCapture = needCaptureForMirrors || needCaptureForEyeZoom || needCaptureForObsOrVc;
             if (needCapture) {
+                // Mirror-only optimization: if mirrors are throttled (e.g. 1 FPS), avoid capturing every SwapBuffers.
+                // EyeZoom / OBS / VC require per-frame capture for smoothness and correctness, so don't throttle then.
+                static auto s_lastMirrorOnlyCaptureSubmit = std::chrono::steady_clock::time_point{};
+                static int s_lastMirrorOnlyW = 0;
+                static int s_lastMirrorOnlyH = 0;
+                bool allowCaptureThisFrame = true;
+
                 GLuint gameTexture = g_cachedGameTextureId.load(std::memory_order_acquire);
                 if (gameTexture != UINT_MAX) {
                     ModeViewportInfo viewport = GetCurrentModeViewport();
                     if (viewport.valid) {
+                        if (needCaptureForMirrors && !needCaptureForEyeZoom && !needCaptureForObsOrVc) {
+                            const int maxMirrorFps = g_activeMirrorCaptureMaxFps.load(std::memory_order_acquire);
+                            if (maxMirrorFps > 0) {
+                                const auto now = std::chrono::steady_clock::now();
+                                const double intervalMsD = 1000.0 / static_cast<double>(std::max(1, maxMirrorFps));
+                                const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                    std::chrono::duration<double, std::milli>(intervalMsD));
+
+                                // If dimensions changed, force capture immediately so mirrors don't go black for up to the throttle interval.
+                                const bool dimsChanged = (viewport.width != s_lastMirrorOnlyW) || (viewport.height != s_lastMirrorOnlyH);
+
+                                if (!dimsChanged && s_lastMirrorOnlyCaptureSubmit.time_since_epoch().count() != 0) {
+                                    if ((now - s_lastMirrorOnlyCaptureSubmit) < interval) {
+                                        allowCaptureThisFrame = false;
+                                    }
+                                }
+
+                                if (allowCaptureThisFrame) {
+                                    s_lastMirrorOnlyCaptureSubmit = now;
+                                    s_lastMirrorOnlyW = viewport.width;
+                                    s_lastMirrorOnlyH = viewport.height;
+                                }
+                            }
+                        }
+
                         // Sync screen/game geometry for capture thread to compute render cache.
                         const int fullW_capture = GetCachedScreenWidth();
                         const int fullH_capture = GetCachedScreenHeight();
@@ -1416,7 +1448,9 @@ static BOOL SwapBuffersHook_Impl(WGLSWAPBUFFERS next, HDC hDc) {
 
                         // SubmitFrameCapture already inserts its own fences and flushes after them;
                         // avoid an extra glFlush here (it can reduce FPS by forcing more driver work per frame).
-                        SubmitFrameCapture(gameTexture, viewport.width, viewport.height);
+                        if (allowCaptureThisFrame) {
+                            SubmitFrameCapture(gameTexture, viewport.width, viewport.height);
+                        }
                     }
                 }
             }

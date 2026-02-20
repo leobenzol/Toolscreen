@@ -20,6 +20,9 @@ std::atomic<bool> g_safeToCapture{ false };
 // Updated by UpdateMirrorCaptureConfigs (logic thread) and read by SwapBuffers hook.
 std::atomic<int> g_activeMirrorCaptureCount{ 0 };
 
+// Summary for capture throttling: see mirror_thread.h
+std::atomic<int> g_activeMirrorCaptureMaxFps{ 0 };
+
 static HGLRC g_mirrorCaptureContext = NULL;
 static HDC g_mirrorCaptureDC = NULL;
 static bool g_mirrorContextIsShared = false; // True if using pre-shared context
@@ -259,7 +262,9 @@ uniform sampler2D screenTexture;
 uniform vec4 u_sourceRect;
 void main() {
     vec2 srcCoord = u_sourceRect.xy + TexCoord * u_sourceRect.zw;
-    FragColor = texture(screenTexture, srcCoord);
+    // Force alpha=1 to avoid propagating undefined/junk alpha from game textures.
+    vec4 c = texture(screenTexture, srcCoord);
+    FragColor = vec4(c.rgb, 1.0);
 })";
 
 // Background shader - simple texture blit with opacity
@@ -733,22 +738,16 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     // Leaking state here can break older MC versions (e.g. fog/sky rendering).
     GLint prevReadFBO = 0;
     GLint prevDrawFBO = 0;
-    GLint prevFramebuffer = 0;
     GLint prevActiveTexture = 0;
     GLint prevTexture2D = 0;
-    GLfloat prevClearColor[4] = { 0, 0, 0, 0 };
-    GLboolean prevColorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
     GLboolean prevDither = GL_FALSE;
     GLboolean prevFramebufferSRGB = GL_FALSE;
     bool hasFramebufferSRGB = false;
 
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFBO);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFBO);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFramebuffer);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTexture2D);
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClearColor);
-    glGetBooleanv(GL_COLOR_WRITEMASK, prevColorMask);
 
     // Some drivers apply dithering when converting to RGBA8 during blits/writes.
     // That can introduce small per-pixel differences, making color matching require higher sensitivity.
@@ -763,9 +762,6 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     auto restoreState = [&]() {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFBO);
-        glBindFramebuffer(GL_FRAMEBUFFER, prevFramebuffer);
-        glColorMask(prevColorMask[0], prevColorMask[1], prevColorMask[2], prevColorMask[3]);
-        glClearColor(prevClearColor[0], prevClearColor[1], prevClearColor[2], prevClearColor[3]);
         glActiveTexture(prevActiveTexture);
         glBindTexture(GL_TEXTURE_2D, prevTexture2D);
 
@@ -875,13 +871,6 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
 
     // Async GPU-to-GPU blit - this is queued but executed by GPU in background
     glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-    // Fix alpha values (still async - GPU does this in pipeline)
-    glBindFramebuffer(GL_FRAMEBUFFER, g_copyFBO);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     // Unbind FBOs (srcFBO is cached and reused across frames)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -1073,12 +1062,12 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
     glBindVertexArray(captureVAO);
     glBindBuffer(GL_ARRAY_BUFFER, captureVBO);
 
-    // Clear FBO - alpha=1 since game texture now has alpha=1 from the alpha-fix pass
+    // Clear FBO. We don't depend on the source texture's alpha; shaders output the alpha we want.
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (useRawOutput) {
-        // Raw output: straight copy from game texture (which now has alpha=1)
+        // Raw output: straight copy from game RGB; the shader forces alpha=1.
         glDisable(GL_BLEND);
     } else {
         // Non-raw: additive blending for multiple input regions
@@ -1978,6 +1967,19 @@ void UpdateMirrorCaptureConfigs(const std::vector<MirrorConfig>& activeMirrors) 
 
     // Publish a cheap summary so the SwapBuffers hook can skip SubmitFrameCapture when nothing needs it.
     g_activeMirrorCaptureCount.store(static_cast<int>(g_threadedMirrorConfigs.size()), std::memory_order_release);
+
+    // Also publish the max FPS requested by mirrors for capture throttling.
+    // If any mirror has fps <= 0, treat as unlimited (0).
+    int maxFps = 0;
+    bool unlimited = false;
+    for (const auto& c : g_threadedMirrorConfigs) {
+        if (c.fps <= 0) {
+            unlimited = true;
+            break;
+        }
+        maxFps = (std::max)(maxFps, c.fps);
+    }
+    g_activeMirrorCaptureMaxFps.store(unlimited ? 0 : maxFps, std::memory_order_release);
 }
 
 void UpdateMirrorFPS(const std::string& mirrorName, int fps) {
@@ -1988,6 +1990,18 @@ void UpdateMirrorFPS(const std::string& mirrorName, int fps) {
             break;
         }
     }
+
+    // Recompute max FPS summary.
+    int maxFps = 0;
+    bool unlimited = false;
+    for (const auto& c : g_threadedMirrorConfigs) {
+        if (c.fps <= 0) {
+            unlimited = true;
+            break;
+        }
+        maxFps = (std::max)(maxFps, c.fps);
+    }
+    g_activeMirrorCaptureMaxFps.store(unlimited ? 0 : maxFps, std::memory_order_release);
 }
 
 void UpdateMirrorOutputPosition(const std::string& mirrorName, int x, int y, float scale, bool separateScale, float scaleX, float scaleY,
