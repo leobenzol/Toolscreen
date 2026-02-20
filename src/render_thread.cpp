@@ -2100,10 +2100,13 @@ static void RT_RenderMirrors(const std::vector<MirrorConfig>& activeMirrors, con
     // This prevents priority inversion where the mirror thread can't acquire the lock
     // because we're holding it while blocking on a GPU fence.
     for (const auto& pf : pendingFences) {
-        GLenum waitResult;
-        do {
-            waitResult = glClientWaitSync(pf.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
-        } while (waitResult == GL_TIMEOUT_EXPIRED);
+        // Prefer GPU-side waits to avoid blocking the render thread CPU.
+        // The subsequent draw calls that sample the mirror textures will naturally stall
+        // on the GPU if needed, while the CPU continues issuing commands.
+        // Guard against stale handles under extreme scheduling jitter.
+        if (pf.fence && glIsSync(pf.fence)) {
+            glWaitSync(pf.fence, 0, GL_TIMEOUT_IGNORED);
+        }
     }
 
     if (mirrorsToRender.empty()) return;

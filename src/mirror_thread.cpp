@@ -6,6 +6,8 @@
 #include "shared_contexts.h"
 #include "utils.h"
 #include <algorithm>
+#include <condition_variable>
+#include <chrono>
 #include <unordered_map>
 #include <thread>
 
@@ -30,6 +32,11 @@ static bool g_mirrorContextIsShared = false; // True if using pre-shared context
 // Shared capture data (main thread writes, capture thread reads)
 std::vector<ThreadedMirrorConfig> g_threadedMirrorConfigs;
 std::mutex g_threadedMirrorConfigMutex;
+
+// Incremented whenever g_threadedMirrorConfigs is mutated.
+// The mirror capture thread uses this to refresh its local cache only when configs change
+// (avoids expensive per-frame vector copying).
+static std::atomic<uint64_t> g_threadedMirrorConfigsVersion{ 1 };
 
 // Game state for capture thread
 std::atomic<int> g_captureGameW{ 0 };
@@ -1219,6 +1226,14 @@ struct MT_MirrorFbos {
     int contentPBOHeight = 0;
     bool contentReadbackPending = false; // True when an async readback is in-flight
     GLsync contentReadbackFence = nullptr; // Fence for the async readback
+
+    // Downsample target used for content detection.
+    // Reading back the full mirror resolution is a major perf hit (PCIe + CPU scan).
+    // We instead blit the alpha mask to a small FBO then read back that.
+    GLuint contentDownsampleFbo = 0;
+    GLuint contentDownsampleTex = 0;
+    int contentDownW = 0;
+    int contentDownH = 0;
 };
 
 static void MirrorCaptureThreadFunc(void* unused) {
@@ -1286,6 +1301,11 @@ static void MirrorCaptureThreadFunc(void* unused) {
 
         // Per-mirror FBOs created on THIS context.
         std::unordered_map<std::string, MT_MirrorFbos> mt_fbos;
+
+        // Mirror config cache (refreshed only when configs change)
+        uint64_t cachedConfigVersion = 0;
+        std::vector<ThreadedMirrorConfig> configsCache;
+        std::vector<std::chrono::steady_clock::time_point> lastCaptureTimes; // indexed by configsCache
 
         // Debug: sample pixels from the shared copy texture (only when Texture Ops logging is enabled)
         GLuint debugSampleFbo = 0;
@@ -1359,17 +1379,22 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 PROFILE_SCOPE_CAT("Check Queue", "Mirror Thread");
                 // Lock-free pop from ring buffer
                 hasNotification = CaptureQueuePop(notif);
+
+                // If the producer is faster than this thread, keep only the newest frame.
+                // This reduces fence waits + mirror work when the game runs > mirror FPS.
+                if (hasNotification) {
+                    FrameCaptureNotification newer = {};
+                    while (CaptureQueuePop(newer)) {
+                        if (notif.fence) { glDeleteSync(notif.fence); }
+                        notif = newer;
+                    }
+                }
             }
 
             if (!hasNotification) {
                 // Nothing new submitted. Don't spin at 1kHz.
                 // If we have no valid texture and/or no active configs, we can wait longer.
-                bool hasConfigs = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
-                    hasConfigs = !g_threadedMirrorConfigs.empty();
-                }
-
+                const bool hasConfigs = (g_activeMirrorCaptureCount.load(std::memory_order_acquire) > 0);
                 const auto waitTime = (!hasValidTexture && !hasConfigs) ? std::chrono::milliseconds(100) : std::chrono::milliseconds(16);
                 std::unique_lock<std::mutex> lk(g_captureSignalMutex);
                 g_captureSignalCV.wait_for(lk, waitTime, [] {
@@ -1387,11 +1412,15 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 GLenum waitResult;
                 {
                     PROFILE_SCOPE_CAT("Waiting for GPU Blit", "Mirror Thread");
-                    // Loop on timeout to handle GPU load - keep waiting until complete
+                    // Wait in short slices so the thread remains responsive to stop requests.
+                    // Flush once (first iteration) to ensure the fence becomes visible.
+                    GLbitfield flags = GL_SYNC_FLUSH_COMMANDS_BIT;
                     do {
-                        waitResult = glClientWaitSync(notif.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL); // 1 sec timeout
+                        waitResult = glClientWaitSync(notif.fence, flags, 5'000'000ULL); // 5ms
+                        flags = 0;
+                        if (g_mirrorCaptureShouldStop.load(std::memory_order_relaxed)) { break; }
                     } while (waitResult == GL_TIMEOUT_EXPIRED);
-                    glDeleteSync(notif.fence);
+                    if (notif.fence) { glDeleteSync(notif.fence); }
                 }
 
                 if (waitResult == GL_WAIT_FAILED) {
@@ -1442,25 +1471,62 @@ static void MirrorCaptureThreadFunc(void* unused) {
             int gameH = validH;
 
             // === PHASE 2: Process mirrors using the valid texture ===
-            std::vector<ThreadedMirrorConfig> configs;
             {
                 PROFILE_SCOPE_CAT("Get Mirror Configs", "Mirror Thread");
-                std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
-                configs = g_threadedMirrorConfigs;
+                uint64_t v = g_threadedMirrorConfigsVersion.load(std::memory_order_acquire);
+                if (v != cachedConfigVersion) {
+                    // Copy only when configs change (under mutex), then do any GL cleanup without holding the mutex.
+                    std::vector<ThreadedMirrorConfig> newCache;
+                    {
+                        std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
+                        newCache = g_threadedMirrorConfigs;
+                    }
+
+                    configsCache = std::move(newCache);
+                    cachedConfigVersion = v;
+                    lastCaptureTimes.assign(configsCache.size(), std::chrono::steady_clock::time_point{});
+
+                    // Keep mt_fbos from ballooning when mirrors are removed.
+                    // (We don't erase aggressively each frame; just prune on config changes.)
+                    if (!mt_fbos.empty()) {
+                        for (auto it = mt_fbos.begin(); it != mt_fbos.end();) {
+                            bool stillExists = false;
+                            for (const auto& c : configsCache) {
+                                if (c.name == it->first) {
+                                    stillExists = true;
+                                    break;
+                                }
+                            }
+                            if (!stillExists) {
+                                if (it->second.backFbo) { glDeleteFramebuffers(1, &it->second.backFbo); }
+                                if (it->second.finalBackFbo) { glDeleteFramebuffers(1, &it->second.finalBackFbo); }
+                                if (it->second.contentDetectionPBO) { glDeleteBuffers(1, &it->second.contentDetectionPBO); }
+                                if (it->second.contentReadbackFence) { glDeleteSync(it->second.contentReadbackFence); }
+                                if (it->second.contentDownsampleFbo) { glDeleteFramebuffers(1, &it->second.contentDownsampleFbo); }
+                                if (it->second.contentDownsampleTex) { glDeleteTextures(1, &it->second.contentDownsampleTex); }
+                                it = mt_fbos.erase(it);
+                                continue;
+                            }
+                            ++it;
+                        }
+                    }
+                }
             }
 
-            if (configs.empty()) { continue; }
+            if (configsCache.empty()) { continue; }
 
             // Global colorspace mode for matching (applies to all mirrors)
             MirrorGammaMode gammaMode = GetGlobalMirrorGammaMode();
 
             // Process each mirror using the copied texture
-            bool didCapture = false;
-            for (auto& conf : configs) {
+            std::vector<MirrorInstance*> readyToPublish;
+            readyToPublish.reserve(configsCache.size());
+            for (size_t confIndex = 0; confIndex < configsCache.size(); confIndex++) {
+                auto& conf = configsCache[confIndex];
                 PROFILE_SCOPE_CAT("Process Mirror", "Mirror Thread");
                 // Check FPS throttling for this mirror
                 if (conf.fps > 0) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - conf.lastCaptureTime).count();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCaptureTimes[confIndex]).count();
                     if (elapsed < (1000 / conf.fps)) { continue; }
                 }
 
@@ -1590,11 +1656,17 @@ static void MirrorCaptureThreadFunc(void* unused) {
                                     fb.contentPBOWidth * fb.contentPBOHeight * 4, GL_MAP_READ_BIT));
                             if (mapped) {
                                 bool hasContent = false;
-                                size_t totalBytes = static_cast<size_t>(fb.contentPBOWidth) * fb.contentPBOHeight * 4;
-                                for (size_t i = 3; i < totalBytes; i += 4) {
-                                    if (mapped[i] > 0) {
-                                        hasContent = true;
-                                        break;
+                                const int w = fb.contentPBOWidth;
+                                const int h = fb.contentPBOHeight;
+                                // Sample rather than scanning every pixel (further reduces CPU cost).
+                                const int step = 4;
+                                for (int y = 0; y < h && !hasContent; y += step) {
+                                    const unsigned char* row = mapped + (static_cast<size_t>(y) * w * 4);
+                                    for (int x = 0; x < w; x += step) {
+                                        if (row[(static_cast<size_t>(x) * 4) + 3] > 0) {
+                                            hasContent = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
@@ -1625,14 +1697,44 @@ static void MirrorCaptureThreadFunc(void* unused) {
                     int fboW = inst->fbo_w;
                     int fboH = inst->fbo_h;
 
-                    // Create or resize PBO if needed
-                    if (fb.contentDetectionPBO == 0 || fb.contentPBOWidth != fboW || fb.contentPBOHeight != fboH) {
+                    // Downsample to reduce readback bandwidth drastically.
+                    // 64x64 is enough to detect "any alpha > 0" in most cases.
+                    constexpr int kDetectMax = 64;
+                    const int detW = (std::min)(fboW, kDetectMax);
+                    const int detH = (std::min)(fboH, kDetectMax);
+
+                    if (detW <= 0 || detH <= 0) {
+                        // Mirror is in a transient/invalid size state.
+                        // Skip content detection this frame (keep previous hasFrameContentBack).
+                    } else {
+
+                    // Create/resize downsample target (texture + FBO) if needed.
+                    if ((fb.contentDownsampleFbo == 0) || (fb.contentDownsampleTex == 0) || (fb.contentDownW != detW) || (fb.contentDownH != detH)) {
+                        if (fb.contentDownsampleFbo == 0) { glGenFramebuffers(1, &fb.contentDownsampleFbo); }
+                        if (fb.contentDownsampleTex == 0) { glGenTextures(1, &fb.contentDownsampleTex); }
+                        glBindTexture(GL_TEXTURE_2D, fb.contentDownsampleTex);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, detW, detH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        glBindTexture(GL_TEXTURE_2D, 0);
+
+                        glBindFramebuffer(GL_FRAMEBUFFER, fb.contentDownsampleFbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.contentDownsampleTex, 0);
+                        fb.contentDownW = detW;
+                        fb.contentDownH = detH;
+                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    }
+
+                    // Create or resize PBO if needed (based on downsample size)
+                    if (fb.contentDetectionPBO == 0 || fb.contentPBOWidth != detW || fb.contentPBOHeight != detH) {
                         if (fb.contentDetectionPBO == 0) { glGenBuffers(1, &fb.contentDetectionPBO); }
                         glBindBuffer(GL_PIXEL_PACK_BUFFER, fb.contentDetectionPBO);
-                        glBufferData(GL_PIXEL_PACK_BUFFER, fboW * fboH * 4, nullptr, GL_STREAM_READ);
+                        glBufferData(GL_PIXEL_PACK_BUFFER, detW * detH * 4, nullptr, GL_STREAM_READ);
                         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                        fb.contentPBOWidth = fboW;
-                        fb.contentPBOHeight = fboH;
+                        fb.contentPBOWidth = detW;
+                        fb.contentPBOHeight = detH;
                     }
 
                     // Clean up any old fence that wasn't harvested
@@ -1641,16 +1743,22 @@ static void MirrorCaptureThreadFunc(void* unused) {
                         fb.contentReadbackFence = nullptr;
                     }
 
-                    // Bind the filter FBO (pass 1 output) and start async read
-                    glBindFramebuffer(GL_READ_FRAMEBUFFER, localBackFbo);
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, fb.contentDetectionPBO);
-                    glReadPixels(0, 0, fboW, fboH, GL_RGBA, GL_UNSIGNED_BYTE, nullptr); // Async into PBO
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                        // Blit the full-size alpha mask into the downsample target, then async read that.
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, localBackFbo);
+                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb.contentDownsampleFbo);
+                        glBlitFramebuffer(0, 0, fboW, fboH, 0, 0, detW, detH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
-                    // Fence so we know when the readback is done
-                    fb.contentReadbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    fb.contentReadbackPending = true;
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.contentDownsampleFbo);
+                        glBindBuffer(GL_PIXEL_PACK_BUFFER, fb.contentDetectionPBO);
+                        glReadPixels(0, 0, detW, detH, GL_RGBA, GL_UNSIGNED_BYTE, nullptr); // Async into PBO
+                        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+                        // Fence so we know when the readback is done
+                        fb.contentReadbackFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                        fb.contentReadbackPending = true;
+                    }
                 }
 
                 // Pre-compute render cache for the render thread
@@ -1676,45 +1784,27 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 if (inst->gpuFenceBack) { glDeleteSync(inst->gpuFenceBack); }
                 inst->gpuFenceBack = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-                // Flush to submit all GPU commands and the fence to the driver.
-                // The render thread will glClientWaitSync on gpuFence (after SwapMirrorBuffers)
-                // to ensure GPU work is complete before reading. glFlush() is sufficient here
-                // because the fence-based wait on the consumer side provides the actual
-                // synchronization guarantee. glFinish() would stall this thread unnecessarily.
-                glFlush();
-
-                // Signal that back buffer is ready
-                inst->captureReady.store(true, std::memory_order_release);
-                conf.lastCaptureTime = now;
-                didCapture = true;
-            }
-
-            // Update only lastCaptureTime in global configs, NOT the full config
-            // This preserves FPS and other settings that may have been updated by GUI during capture
-            if (didCapture) {
-                std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
-                for (const auto& localConf : configs) {
-                    for (auto& globalConf : g_threadedMirrorConfigs) {
-                        if (globalConf.name == localConf.name) {
-                            globalConf.lastCaptureTime = localConf.lastCaptureTime;
-                            break;
-                        }
-                    }
-                }
+                // Defer publishing captureReady until after a single batched glFlush below.
+                // This avoids redundant flushes and prevents the render thread from observing
+                // a fence that hasn't been flushed to the driver yet.
+                readyToPublish.push_back(inst);
+                lastCaptureTimes[confIndex] = now;
             }
 
             // Note: OBS capture is done synchronously in CaptureToObsFBO (dllmain.cpp)
             // because it needs to capture the complete rendered frame from the backbuffer
             // which includes animations and overlays applied by the game thread
 
-            // Ensure work is submitted
-            glFlush();
-
-            {
-                PROFILE_SCOPE_CAT("Sleeping", "Mirror Thread");
-                // Sleep briefly to avoid spinning
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Submit all queued GPU work and make fences visible to other contexts.
+            if (!readyToPublish.empty()) {
+                glFlush();
+                for (MirrorInstance* inst : readyToPublish) {
+                    inst->captureReady.store(true, std::memory_order_release);
+                }
             }
+
+            // No unconditional sleep here: the condition-variable wait above handles idle periods.
+            // Sleeping every frame adds latency and can cause the capture queue to overflow.
         }
 
         // Cleanup local GPU resources
@@ -1733,6 +1823,8 @@ static void MirrorCaptureThreadFunc(void* unused) {
             if (kv.second.finalBackFbo) { glDeleteFramebuffers(1, &kv.second.finalBackFbo); }
             if (kv.second.contentDetectionPBO) { glDeleteBuffers(1, &kv.second.contentDetectionPBO); }
             if (kv.second.contentReadbackFence) { glDeleteSync(kv.second.contentReadbackFence); }
+            if (kv.second.contentDownsampleFbo) { glDeleteFramebuffers(1, &kv.second.contentDownsampleFbo); }
+            if (kv.second.contentDownsampleTex) { glDeleteTextures(1, &kv.second.contentDownsampleTex); }
         }
         mt_fbos.clear();
 
@@ -1902,9 +1994,6 @@ void UpdateMirrorCaptureConfigs(const std::vector<MirrorConfig>& activeMirrors) 
     std::vector<ThreadedMirrorConfig> configs;
     configs.reserve(activeMirrors.size());
 
-    // Get existing configs to preserve timing data (lastCaptureTime)
-    std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
-
     for (const auto& m : activeMirrors) {
         ThreadedMirrorConfig conf;
         conf.name = m.name;
@@ -1938,15 +2027,19 @@ void UpdateMirrorCaptureConfigs(const std::vector<MirrorConfig>& activeMirrors) 
         conf.outputY = m.output.y;
         conf.outputRelativeTo = m.output.relativeTo;
 
-        // Preserve lastCaptureTime from existing config to maintain FPS throttling
-        for (const auto& existingConf : g_threadedMirrorConfigs) {
-            if (existingConf.name == m.name) {
-                conf.lastCaptureTime = existingConf.lastCaptureTime;
-                break;
-            }
-        }
-
         configs.push_back(conf);
+    }
+
+    // Compute summaries from the local vector (avoid reading g_threadedMirrorConfigs without its mutex).
+    const int mirrorCount = static_cast<int>(configs.size());
+    int maxFps = 0;
+    bool unlimited = false;
+    for (const auto& c : configs) {
+        if (c.fps <= 0) {
+            unlimited = true;
+            break;
+        }
+        maxFps = (std::max)(maxFps, c.fps);
     }
 
     // Clear captureReady for all mirrors to allow capture thread to start fresh
@@ -1963,23 +2056,21 @@ void UpdateMirrorCaptureConfigs(const std::vector<MirrorConfig>& activeMirrors) 
         }
     }
 
-    g_threadedMirrorConfigs = configs;
+    {
+        std::lock_guard<std::mutex> lock(g_threadedMirrorConfigMutex);
+        g_threadedMirrorConfigs = std::move(configs);
+        g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
+    }
 
     // Publish a cheap summary so the SwapBuffers hook can skip SubmitFrameCapture when nothing needs it.
-    g_activeMirrorCaptureCount.store(static_cast<int>(g_threadedMirrorConfigs.size()), std::memory_order_release);
+    g_activeMirrorCaptureCount.store(mirrorCount, std::memory_order_release);
 
     // Also publish the max FPS requested by mirrors for capture throttling.
     // If any mirror has fps <= 0, treat as unlimited (0).
-    int maxFps = 0;
-    bool unlimited = false;
-    for (const auto& c : g_threadedMirrorConfigs) {
-        if (c.fps <= 0) {
-            unlimited = true;
-            break;
-        }
-        maxFps = (std::max)(maxFps, c.fps);
-    }
     g_activeMirrorCaptureMaxFps.store(unlimited ? 0 : maxFps, std::memory_order_release);
+
+    // Wake the mirror thread (it may be waiting with a long timeout when configs are empty).
+    g_captureSignalCV.notify_one();
 }
 
 void UpdateMirrorFPS(const std::string& mirrorName, int fps) {
@@ -1990,6 +2081,8 @@ void UpdateMirrorFPS(const std::string& mirrorName, int fps) {
             break;
         }
     }
+
+    g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
 
     // Recompute max FPS summary.
     int maxFps = 0;
@@ -2002,6 +2095,8 @@ void UpdateMirrorFPS(const std::string& mirrorName, int fps) {
         maxFps = (std::max)(maxFps, c.fps);
     }
     g_activeMirrorCaptureMaxFps.store(unlimited ? 0 : maxFps, std::memory_order_release);
+
+    g_captureSignalCV.notify_one();
 }
 
 void UpdateMirrorOutputPosition(const std::string& mirrorName, int x, int y, float scale, bool separateScale, float scaleX, float scaleY,
@@ -2021,7 +2116,11 @@ void UpdateMirrorOutputPosition(const std::string& mirrorName, int x, int y, flo
                 break;
             }
         }
+
+        g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
     }
+
+    g_captureSignalCV.notify_one();
 
     // Invalidate cached render state in mirror instance
     // This ensures the render thread recalculates positions immediately
@@ -2056,7 +2155,11 @@ void UpdateMirrorGroupOutputPosition(const std::vector<std::string>& mirrorIds, 
                 conf.outputRelativeTo = relativeTo;
             }
         }
+
+        g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
     }
+
+    g_captureSignalCV.notify_one();
 
     // Invalidate cached render state for all mirrors in the group
     {
@@ -2079,6 +2182,9 @@ void UpdateMirrorInputRegions(const std::string& mirrorName, const std::vector<M
             break;
         }
     }
+
+    g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
+    g_captureSignalCV.notify_one();
 }
 
 void UpdateMirrorCaptureSettings(const std::string& mirrorName, int captureWidth, int captureHeight, const MirrorBorderConfig& border,
@@ -2110,4 +2216,7 @@ void UpdateMirrorCaptureSettings(const std::string& mirrorName, int captureWidth
             break;
         }
     }
+
+    g_threadedMirrorConfigsVersion.fetch_add(1, std::memory_order_release);
+    g_captureSignalCV.notify_one();
 }
