@@ -694,24 +694,69 @@ void LogException(const std::string& context, const std::exception& e) {
 }
 
 void LogException(const std::string& context, DWORD exceptionCode, EXCEPTION_POINTERS* exceptionInfo) {
-    std::stringstream ss;
-    ss << "STRUCTURED EXCEPTION in " << context << ": Code=0x" << std::hex << exceptionCode;
+    // IMPORTANT PERFORMANCE NOTE:
+    // If an exception occurs repeatedly (e.g. every frame inside SwapBuffers), logging + stack traces + FlushLogs()
+    // can create a catastrophic feedback loop that tanks FPS. This function therefore rate-limits expensive work.
 
-    if (exceptionInfo && exceptionInfo->ExceptionRecord) {
-        ss << " Address=0x" << std::hex << reinterpret_cast<uintptr_t>(exceptionInfo->ExceptionRecord->ExceptionAddress);
+    const uint64_t nowMs = GetTickCount64();
+    const uintptr_t addr = (exceptionInfo && exceptionInfo->ExceptionRecord)
+                               ? reinterpret_cast<uintptr_t>(exceptionInfo->ExceptionRecord->ExceptionAddress)
+                               : 0;
+
+    // Per-process spam guard for repeated identical SEH events.
+    // Keeps the first log, then suppresses repeats for a short window.
+    static std::atomic<uint64_t> s_lastSehLogMs{ 0 };
+    static std::atomic<DWORD> s_lastSehCode{ 0 };
+    static std::atomic<uintptr_t> s_lastSehAddr{ 0 };
+    static std::atomic<uint32_t> s_suppressedSehCount{ 0 };
+
+    const DWORD lastCode = s_lastSehCode.load(std::memory_order_relaxed);
+    const uintptr_t lastAddr = s_lastSehAddr.load(std::memory_order_relaxed);
+    const uint64_t lastMs = s_lastSehLogMs.load(std::memory_order_relaxed);
+
+    // Suppress if same code+address within this window.
+    constexpr uint64_t kRepeatSuppressWindowMs = 250;
+    const bool isRepeatBurst = (exceptionCode == lastCode) && (addr == lastAddr) && (lastMs != 0) && ((nowMs - lastMs) < kRepeatSuppressWindowMs);
+    if (isRepeatBurst) {
+        s_suppressedSehCount.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
 
+    // Emit a summary if we suppressed repeats.
+    const uint32_t suppressed = s_suppressedSehCount.exchange(0, std::memory_order_relaxed);
+    if (suppressed > 0) {
+        Log("(Suppressed " + std::to_string(suppressed) + " repeat structured exceptions in last " +
+            std::to_string(kRepeatSuppressWindowMs) + "ms)");
+    }
+
+    s_lastSehCode.store(exceptionCode, std::memory_order_relaxed);
+    s_lastSehAddr.store(addr, std::memory_order_relaxed);
+    s_lastSehLogMs.store(nowMs, std::memory_order_relaxed);
+
+    std::stringstream ss;
+    ss << "STRUCTURED EXCEPTION in " << context << ": Code=0x" << std::hex << exceptionCode;
+    if (addr != 0) { ss << " Address=0x" << std::hex << addr; }
     Log(ss.str());
 
-    // Try to get a simple stack trace
-    if (exceptionInfo) {
+    // Try to get a simple stack trace, but do it at most once per second.
+    static std::atomic<uint64_t> s_lastStackMs{ 0 };
+    const uint64_t lastStack = s_lastStackMs.load(std::memory_order_relaxed);
+    constexpr uint64_t kStackTraceMinIntervalMs = 1000;
+    if (exceptionInfo && (lastStack == 0 || (nowMs - lastStack) >= kStackTraceMinIntervalMs)) {
+        s_lastStackMs.store(nowMs, std::memory_order_relaxed);
         void* stack[32];
         USHORT frames = CaptureStackBackTrace(0, 32, stack, NULL);
         Log(FormatStackTraceWithSymbols(stack, frames));
     }
 
-    // Force flush after exception logging
-    FlushLogs();
+    // Force flush after exception logging, but rate-limit flushes to avoid I/O storms.
+    static std::atomic<uint64_t> s_lastFlushMs{ 0 };
+    constexpr uint64_t kFlushMinIntervalMs = 1000;
+    const uint64_t lastFlush = s_lastFlushMs.load(std::memory_order_relaxed);
+    if (lastFlush == 0 || (nowMs - lastFlush) >= kFlushMinIntervalMs) {
+        s_lastFlushMs.store(nowMs, std::memory_order_relaxed);
+        FlushLogs();
+    }
 }
 
 LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {

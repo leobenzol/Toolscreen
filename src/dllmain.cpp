@@ -1340,31 +1340,84 @@ static BOOL SwapBuffersHook_Impl(WGLSWAPBUFFERS next, HDC hDc) {
         {
             HGLRC currentContext = wglGetCurrentContext();
             HGLRC lastContext = g_lastSeenGameGLContext.load(std::memory_order_acquire);
-            if (currentContext && lastContext && currentContext != lastContext) {
-                Log("[RENDER] Detected WGL context change - restarting shared contexts/threads");
+            const uint64_t nowMs = GetTickCount64();
 
-                StopObsHookThread();
-                StopMirrorCaptureThread();
-                StopRenderThread();
+            // Some environments (mods/overlays/drivers) can temporarily switch WGL contexts or alternate between
+            // multiple contexts. Restarting shared contexts/threads immediately in that case can cause severe lag
+            // and make mirrors/overlays appear to "stop" (threads never stabilize). Debounce restarts.
+            static HGLRC s_pendingContext = NULL;
+            static uint64_t s_pendingSinceMs = 0;
+            static uint64_t s_lastRestartMs = 0;
+            constexpr uint64_t kContextStableMs = 250;
+            constexpr uint64_t kMinRestartIntervalMs = 2000;
 
-                CleanupSharedContexts();
-
-                if (InitializeSharedContexts(currentContext, hDc)) {
-                    Log("[RENDER] Reinitialized shared contexts after context change");
-                } else {
-                    Log("[RENDER] Failed to reinitialize shared contexts after context change - restarting threads in fallback mode");
+            const bool contextChanged = (currentContext && lastContext && currentContext != lastContext);
+            if (contextChanged) {
+                if (s_pendingContext != currentContext) {
+                    s_pendingContext = currentContext;
+                    s_pendingSinceMs = nowMs;
                 }
 
-                // Restart worker threads regardless of shared-context init success.
-                StartRenderThread(currentContext);
-                StartMirrorCaptureThread(currentContext);
-                StartObsHookThread();
+                const bool stableLongEnough = (s_pendingSinceMs != 0) && ((nowMs - s_pendingSinceMs) >= kContextStableMs);
+                const bool restartAllowed = (s_lastRestartMs == 0) || ((nowMs - s_lastRestartMs) >= kMinRestartIntervalMs);
+                if (stableLongEnough && restartAllowed) {
+                    Log("[RENDER] Detected stable WGL context change - restarting shared contexts/threads");
+                    s_lastRestartMs = nowMs;
+                    s_pendingContext = NULL;
+                    s_pendingSinceMs = 0;
 
-                // Force recache of game texture IDs in the new context.
-                g_cachedGameTextureId.store(UINT_MAX, std::memory_order_release);
-                g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
-            } else if (currentContext && (!lastContext)) {
-                g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
+                    StopObsHookThread();
+                    StopMirrorCaptureThread();
+                    StopRenderThread();
+
+                    CleanupSharedContexts();
+
+                    if (InitializeSharedContexts(currentContext, hDc)) {
+                        Log("[RENDER] Reinitialized shared contexts after context change");
+                    } else {
+                        Log("[RENDER] Failed to reinitialize shared contexts after context change - restarting threads in fallback mode");
+                    }
+
+                    // Restart worker threads regardless of shared-context init success.
+                    StartRenderThread(currentContext);
+                    StartMirrorCaptureThread(currentContext);
+                    StartObsHookThread();
+
+                    // Force recache of game texture IDs in the new context.
+                    g_cachedGameTextureId.store(UINT_MAX, std::memory_order_release);
+                    g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
+                }
+            } else {
+                // No change (or missing context) => clear pending state.
+                s_pendingContext = NULL;
+                s_pendingSinceMs = 0;
+                if (currentContext && (!lastContext)) {
+                    g_lastSeenGameGLContext.store(currentContext, std::memory_order_release);
+                }
+            }
+
+            // Thread health watchdog (rate-limited): if a worker thread crashed/exited, try restarting it.
+            // This helps recover from transient driver/ImGui/font/etc crashes that would otherwise leave mirrors black.
+            {
+                static uint64_t s_lastHealthRestartAttemptMs = 0;
+                constexpr uint64_t kHealthRestartIntervalMs = 2000;
+                if (currentContext && (s_lastHealthRestartAttemptMs == 0 || (nowMs - s_lastHealthRestartAttemptMs) >= kHealthRestartIntervalMs)) {
+                    s_lastHealthRestartAttemptMs = nowMs;
+
+                    // Only restart capture thread when something actually consumes captures.
+                    const bool needCaptureForMirrors = (g_activeMirrorCaptureCount.load(std::memory_order_acquire) > 0);
+                    const bool needCaptureForEyeZoom = g_showEyeZoom.load(std::memory_order_relaxed) ||
+                                                       g_isTransitioningFromEyeZoom.load(std::memory_order_relaxed);
+                    const bool needCaptureForObsOrVc = g_graphicsHookDetected.load(std::memory_order_acquire) || IsVirtualCameraActive();
+                    const bool needCapture = needCaptureForMirrors || needCaptureForEyeZoom || needCaptureForObsOrVc;
+
+                    if (!g_renderThreadRunning.load(std::memory_order_acquire)) {
+                        StartRenderThread(currentContext);
+                    }
+                    if (needCapture && !g_mirrorCaptureRunning.load(std::memory_order_acquire)) {
+                        StartMirrorCaptureThread(currentContext);
+                    }
+                }
             }
         }
 

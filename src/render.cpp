@@ -1114,8 +1114,8 @@ void CleanupGPUResources() {
             }
 
             // Clean up GPU sync fences
-            if (v.gpuFence) { glDeleteSync(v.gpuFence); }
-            if (v.gpuFenceBack) { glDeleteSync(v.gpuFenceBack); }
+            if (v.gpuFence && glIsSync(v.gpuFence)) { glDeleteSync(v.gpuFence); }
+            if (v.gpuFenceBack && glIsSync(v.gpuFenceBack)) { glDeleteSync(v.gpuFenceBack); }
         }
         g_mirrorInstances.clear();
 
@@ -3245,7 +3245,7 @@ void RenderModeInternal(const ModeConfig* modeToRender, const GLState& s, int cu
             // Create fence after blit for delayRenderingUntilBlitted setting
             // Delete any existing fence first (shouldn't happen normally, but be safe)
             GLsync oldFence = g_overlayBlitFence.exchange(nullptr, std::memory_order_acq_rel);
-            if (oldFence) { glDeleteSync(oldFence); }
+            if (oldFence && glIsSync(oldFence)) { glDeleteSync(oldFence); }
             g_overlayBlitFence.store(glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), std::memory_order_release);
         }
     }

@@ -34,6 +34,64 @@ static HGLRC g_renderThreadContext = NULL;
 static HDC g_renderThreadDC = NULL;
 static bool g_renderContextIsShared = false; // True if using pre-shared context
 
+// Fallback-mode DC ownership:
+// Using the game's HDC on a different thread is undefined on some drivers and can cause
+// intermittent SEH/AVs and black mirrors. Prefer a dedicated dummy window/DC.
+static HWND g_renderFallbackDummyHwnd = NULL;
+static HDC g_renderFallbackDummyDC = NULL;
+static HWND g_renderOwnedDCHwnd = NULL; // Non-null when we called GetDC(hwnd) for g_renderThreadDC
+
+static bool RT_CreateFallbackDummyWindowWithMatchingPixelFormat(HDC gameHdc, const wchar_t* windowNameTag, HWND& outHwnd, HDC& outDc) {
+    if (outHwnd && outDc) { return true; }
+    if (!gameHdc) { return false; }
+
+    int gamePf = GetPixelFormat(gameHdc);
+    if (gamePf == 0) { return false; }
+
+    PIXELFORMATDESCRIPTOR gamePfd = {};
+    gamePfd.nSize = sizeof(gamePfd);
+    gamePfd.nVersion = 1;
+    if (DescribePixelFormat(gameHdc, gamePf, sizeof(gamePfd), &gamePfd) == 0) { return false; }
+
+    static ATOM s_atom = 0;
+    if (!s_atom) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_OWNDC;
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"ToolscreenRenderThreadDummy";
+        s_atom = RegisterClassExW(&wc);
+        if (!s_atom) {
+            DWORD err = GetLastError();
+            if (err != ERROR_CLASS_ALREADY_EXISTS) { return false; }
+        }
+    }
+
+    std::wstring wndName = L"ToolscreenRenderThreadDummy_";
+    wndName += (windowNameTag ? windowNameTag : L"render");
+
+    outHwnd = CreateWindowExW(0, L"ToolscreenRenderThreadDummy", wndName.c_str(), WS_OVERLAPPED, 0, 0, 1, 1, NULL, NULL,
+                              GetModuleHandleW(NULL), NULL);
+    if (!outHwnd) { return false; }
+
+    outDc = GetDC(outHwnd);
+    if (!outDc) {
+        DestroyWindow(outHwnd);
+        outHwnd = NULL;
+        return false;
+    }
+
+    if (!SetPixelFormat(outDc, gamePf, &gamePfd)) {
+        ReleaseDC(outHwnd, outDc);
+        DestroyWindow(outHwnd);
+        outDc = NULL;
+        outHwnd = NULL;
+        return false;
+    }
+    return true;
+}
+
 struct RenderFBO {
     GLuint fbo = 0;
     GLuint texture = 0;
@@ -78,7 +136,7 @@ static void RT_WaitForConsumerFence(bool isObsRequest, int writeIdx) {
     if (consumer) {
         // Guard in case a stale/invalid handle was left behind.
         if (glIsSync(consumer)) { glWaitSync(consumer, 0, GL_TIMEOUT_IGNORED); }
-        glDeleteSync(consumer);
+        if (glIsSync(consumer)) { glDeleteSync(consumer); }
     }
 }
 
@@ -1332,7 +1390,7 @@ static void CleanupRenderFBOs() {
             fbo.stencilRbo = 0;
         }
         if (fbo.gpuFence != nullptr) {
-            glDeleteSync(fbo.gpuFence);
+            if (glIsSync(fbo.gpuFence)) { glDeleteSync(fbo.gpuFence); }
             fbo.gpuFence = nullptr;
         }
         fbo.width = 0;
@@ -1356,7 +1414,7 @@ static void CleanupRenderFBOs() {
             fbo.stencilRbo = 0;
         }
         if (fbo.gpuFence != nullptr) {
-            glDeleteSync(fbo.gpuFence);
+            if (glIsSync(fbo.gpuFence)) { glDeleteSync(fbo.gpuFence); }
             fbo.gpuFence = nullptr;
         }
         fbo.width = 0;
@@ -1397,7 +1455,7 @@ static void CleanupRenderFBOs() {
         g_vcReadbackFBO = 0;
     }
     if (g_vcFence) {
-        glDeleteSync(g_vcFence);
+        if (glIsSync(g_vcFence)) { glDeleteSync(g_vcFence); }
         g_vcFence = nullptr;
     }
     if (g_vcScaleFBO != 0) {
@@ -1529,7 +1587,7 @@ static void EnsureVCImageResources(int w, int h) {
     g_vcComputePending = false;
     g_vcReadbackPending = false;
     if (g_vcFence) {
-        glDeleteSync(g_vcFence);
+        if (glIsSync(g_vcFence)) { glDeleteSync(g_vcFence); }
         g_vcFence = nullptr;
     }
 }
@@ -1561,7 +1619,7 @@ static void StartVirtualCameraComputeReadback(GLuint srcTexture, int texW, int t
         // Non-blocking check: if GPU isn't done yet, skip this frame's virtual camera update
         GLenum result = glClientWaitSync(g_vcFence, 0, 0);
         if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
-            glDeleteSync(g_vcFence);
+            if (glIsSync(g_vcFence)) { glDeleteSync(g_vcFence); }
             g_vcFence = nullptr;
             g_vcComputePending = false;
 
@@ -3459,8 +3517,9 @@ static void RenderThreadFunc(void* gameGLContext) {
                 }
                 // If no ready frame and no fallback available, just show background (first few frames at startup)
 
-                // Clean up the game fence (we may have used it above for fallback)
-                if (request.gameTextureFence) { glDeleteSync(request.gameTextureFence); }
+                // Clean up the game fence (the render thread owns this handle).
+                // Guard against stale/invalid handles across context recreation.
+                if (request.gameTextureFence && glIsSync(request.gameTextureFence)) { glDeleteSync(request.gameTextureFence); }
             } else {
                 // Non-OBS pass: transparent background so overlays composite on top of game
                 // Background/border rendering is done on main thread (render.cpp), we only render overlays here
@@ -3590,7 +3649,9 @@ static void RenderThreadFunc(void* gameGLContext) {
                     GLsync oldFence = g_lastGoodObsFence.exchange(fence, std::memory_order_acq_rel);
                     // Deferred deletion: delete the fence from 2 cycles ago, store current old fence
                     if (g_pendingDeleteObsFences[g_pendingDeleteObsIndex]) {
-                        glDeleteSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex]);
+                        if (glIsSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex])) {
+                            glDeleteSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex]);
+                        }
                     }
                     g_pendingDeleteObsFences[g_pendingDeleteObsIndex] = oldFence;
                     g_pendingDeleteObsIndex = (g_pendingDeleteObsIndex + 1) % FENCE_DELETION_DELAY;
@@ -3599,7 +3660,9 @@ static void RenderThreadFunc(void* gameGLContext) {
                     // Exchange fences - delete the OLDEST pending fence, not the one just swapped out
                     GLsync oldFence = g_lastGoodFence.exchange(fence, std::memory_order_acq_rel);
                     // Deferred deletion: delete the fence from 2 cycles ago, store current old fence
-                    if (g_pendingDeleteFences[g_pendingDeleteIndex]) { glDeleteSync(g_pendingDeleteFences[g_pendingDeleteIndex]); }
+                    if (g_pendingDeleteFences[g_pendingDeleteIndex]) {
+                        if (glIsSync(g_pendingDeleteFences[g_pendingDeleteIndex])) { glDeleteSync(g_pendingDeleteFences[g_pendingDeleteIndex]); }
+                    }
                     g_pendingDeleteFences[g_pendingDeleteIndex] = oldFence;
                     g_pendingDeleteIndex = (g_pendingDeleteIndex + 1) % FENCE_DELETION_DELAY;
                     g_lastGoodTexture.store(writeFBO.texture, std::memory_order_release);
@@ -4018,7 +4081,11 @@ static void RenderThreadFunc(void* gameGLContext) {
                 // Exchange fences - delete the OLDEST pending fence, not the one just swapped out
                 GLsync oldFence = g_lastGoodObsFence.exchange(fence, std::memory_order_acq_rel);
                 // Deferred deletion: delete the fence from 2 cycles ago, store current old fence
-                if (g_pendingDeleteObsFences[g_pendingDeleteObsIndex]) { glDeleteSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex]); }
+                if (g_pendingDeleteObsFences[g_pendingDeleteObsIndex]) {
+                    if (glIsSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex])) {
+                        glDeleteSync(g_pendingDeleteObsFences[g_pendingDeleteObsIndex]);
+                    }
+                }
                 g_pendingDeleteObsFences[g_pendingDeleteObsIndex] = oldFence;
                 g_pendingDeleteObsIndex = (g_pendingDeleteObsIndex + 1) % FENCE_DELETION_DELAY;
                 g_lastGoodObsTexture.store(writeFBO.texture, std::memory_order_release);
@@ -4084,7 +4151,9 @@ static void RenderThreadFunc(void* gameGLContext) {
                 // Exchange fences - delete the OLDEST pending fence, not the one just swapped out
                 GLsync oldFence = g_lastGoodFence.exchange(fence, std::memory_order_acq_rel);
                 // Deferred deletion: delete the fence from 2 cycles ago, store current old fence
-                if (g_pendingDeleteFences[g_pendingDeleteIndex]) { glDeleteSync(g_pendingDeleteFences[g_pendingDeleteIndex]); }
+                if (g_pendingDeleteFences[g_pendingDeleteIndex]) {
+                    if (glIsSync(g_pendingDeleteFences[g_pendingDeleteIndex])) { glDeleteSync(g_pendingDeleteFences[g_pendingDeleteIndex]); }
+                }
                 g_pendingDeleteFences[g_pendingDeleteIndex] = oldFence;
                 g_pendingDeleteIndex = (g_pendingDeleteIndex + 1) % FENCE_DELETION_DELAY;
                 g_lastGoodTexture.store(writeFBO.texture, std::memory_order_release);
@@ -4185,6 +4254,28 @@ void StartRenderThread(void* gameGLContext) {
         } else {
             Log("Render Thread: Joining finished thread...");
             g_renderThread.join();
+
+            // If the previous thread exited early (exception), it may not have cleaned up.
+            if (!g_renderContextIsShared && g_renderThreadContext) {
+                wglDeleteContext(g_renderThreadContext);
+                g_renderThreadContext = NULL;
+            }
+            if (!g_renderContextIsShared) {
+                if (g_renderOwnedDCHwnd && g_renderThreadDC) {
+                    ReleaseDC(g_renderOwnedDCHwnd, g_renderThreadDC);
+                }
+                g_renderOwnedDCHwnd = NULL;
+
+                if (g_renderFallbackDummyHwnd && g_renderFallbackDummyDC) {
+                    ReleaseDC(g_renderFallbackDummyHwnd, g_renderFallbackDummyDC);
+                    g_renderFallbackDummyDC = NULL;
+                }
+                if (g_renderFallbackDummyHwnd) {
+                    DestroyWindow(g_renderFallbackDummyHwnd);
+                    g_renderFallbackDummyHwnd = NULL;
+                }
+                g_renderThreadDC = NULL;
+            }
         }
     }
 
@@ -4202,24 +4293,47 @@ void StartRenderThread(void* gameGLContext) {
         // Fallback: Create and share context now
         g_renderContextIsShared = false;
 
-        // Get current DC
-        HDC hdc = wglGetCurrentDC();
-        if (!hdc) {
+        // Get current (game) DC. Prefer the actual current DC.
+        HDC gameHdc = wglGetCurrentDC();
+        HWND gameHwndForDC = NULL;
+        if (!gameHdc) {
             HWND hwnd = g_minecraftHwnd.load();
-            if (hwnd) { hdc = GetDC(hwnd); }
+            if (hwnd) {
+                gameHdc = GetDC(hwnd);
+                gameHwndForDC = hwnd;
+            }
         }
 
-        if (!hdc) {
+        if (!gameHdc) {
             Log("Render Thread: No DC available");
             return;
         }
 
-        g_renderThreadDC = hdc;
+        // Prefer a dedicated dummy DC for the worker context to avoid cross-thread HDC issues.
+        if (RT_CreateFallbackDummyWindowWithMatchingPixelFormat(gameHdc, L"render", g_renderFallbackDummyHwnd, g_renderFallbackDummyDC) &&
+            g_renderFallbackDummyDC) {
+            g_renderThreadDC = g_renderFallbackDummyDC;
+            // If we had to call GetDC(hwnd) only to query the pixel format, release it now.
+            if (gameHwndForDC) {
+                ReleaseDC(gameHwndForDC, gameHdc);
+                gameHwndForDC = NULL;
+            }
+            g_renderOwnedDCHwnd = NULL;
+        } else {
+            // Fall back to using the game HDC (less stable on some drivers).
+            g_renderThreadDC = gameHdc;
+            g_renderOwnedDCHwnd = gameHwndForDC; // Release on StopRenderThread if non-null
+        }
 
         // Create the render context on main thread
-        g_renderThreadContext = wglCreateContext(hdc);
+        g_renderThreadContext = wglCreateContext(g_renderThreadDC);
         if (!g_renderThreadContext) {
             Log("Render Thread: Failed to create GL context (error " + std::to_string(GetLastError()) + ")");
+            if (g_renderOwnedDCHwnd && g_renderThreadDC) {
+                ReleaseDC(g_renderOwnedDCHwnd, g_renderThreadDC);
+                g_renderOwnedDCHwnd = NULL;
+                g_renderThreadDC = NULL;
+            }
             return;
         }
 
@@ -4283,6 +4397,33 @@ void StopRenderThread() {
     if (g_renderThread.joinable()) { g_renderThread.join(); }
 
     Log("Render Thread: Joined");
+
+    // If the render thread crashed, it may not have reached its normal cleanup path.
+    // Ensure the fallback context is deleted here to avoid leaking contexts/share-groups.
+    if (!g_renderContextIsShared && g_renderThreadContext) {
+        wglDeleteContext(g_renderThreadContext);
+        g_renderThreadContext = NULL;
+    }
+
+    // If we created a fallback dummy window/DC, destroy it on the main thread after join.
+    if (!g_renderContextIsShared) {
+        if (g_renderOwnedDCHwnd && g_renderThreadDC) {
+            ReleaseDC(g_renderOwnedDCHwnd, g_renderThreadDC);
+        }
+        g_renderOwnedDCHwnd = NULL;
+
+        if (g_renderFallbackDummyHwnd && g_renderFallbackDummyDC) {
+            ReleaseDC(g_renderFallbackDummyHwnd, g_renderFallbackDummyDC);
+            g_renderFallbackDummyDC = NULL;
+        }
+        if (g_renderFallbackDummyHwnd) {
+            DestroyWindow(g_renderFallbackDummyHwnd);
+            g_renderFallbackDummyHwnd = NULL;
+        }
+
+        // Only clear the DC pointer if we owned it in fallback mode.
+        g_renderThreadDC = NULL;
+    }
 }
 
 void SubmitFrameForRendering(const FrameRenderRequest& request) {
@@ -4356,12 +4497,12 @@ void SubmitRenderFBOConsumerFence(int fboIndex, GLsync consumerFence) {
     if (!consumerFence) return;
     if (fboIndex < 0 || fboIndex >= RENDER_THREAD_FBO_COUNT) {
         // Can't associate it; delete to avoid leaking.
-        glDeleteSync(consumerFence);
+        if (glIsSync(consumerFence)) { glDeleteSync(consumerFence); }
         return;
     }
 
     GLsync old = g_renderFBOConsumerFences[fboIndex].exchange(consumerFence, std::memory_order_acq_rel);
-    if (old) { glDeleteSync(old); }
+    if (old && glIsSync(old)) { glDeleteSync(old); }
 }
 
 void SubmitObsFrameContext(const ObsFrameSubmission& submission) {

@@ -29,6 +29,64 @@ static HGLRC g_mirrorCaptureContext = NULL;
 static HDC g_mirrorCaptureDC = NULL;
 static bool g_mirrorContextIsShared = false; // True if using pre-shared context
 
+// Fallback-mode DC ownership (see shared_contexts.h notes):
+// Using the game's HDC on a different thread is undefined on some drivers and can trigger
+// intermittent SEH/AVs or mirrors going black.
+static HWND g_mirrorFallbackDummyHwnd = NULL;
+static HDC g_mirrorFallbackDummyDC = NULL;
+static HWND g_mirrorOwnedDCHwnd = NULL; // Non-null when we called GetDC(hwnd) for g_mirrorCaptureDC
+
+static bool MT_CreateFallbackDummyWindowWithMatchingPixelFormat(HDC gameHdc, const wchar_t* windowNameTag, HWND& outHwnd, HDC& outDc) {
+    if (outHwnd && outDc) { return true; }
+    if (!gameHdc) { return false; }
+
+    int gamePf = GetPixelFormat(gameHdc);
+    if (gamePf == 0) { return false; }
+
+    PIXELFORMATDESCRIPTOR gamePfd = {};
+    gamePfd.nSize = sizeof(gamePfd);
+    gamePfd.nVersion = 1;
+    if (DescribePixelFormat(gameHdc, gamePf, sizeof(gamePfd), &gamePfd) == 0) { return false; }
+
+    static ATOM s_atom = 0;
+    if (!s_atom) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_OWNDC;
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"ToolscreenMirrorThreadDummy";
+        s_atom = RegisterClassExW(&wc);
+        if (!s_atom) {
+            DWORD err = GetLastError();
+            if (err != ERROR_CLASS_ALREADY_EXISTS) { return false; }
+        }
+    }
+
+    std::wstring wndName = L"ToolscreenMirrorThreadDummy_";
+    wndName += (windowNameTag ? windowNameTag : L"mirror");
+
+    outHwnd = CreateWindowExW(0, L"ToolscreenMirrorThreadDummy", wndName.c_str(), WS_OVERLAPPED, 0, 0, 1, 1, NULL, NULL,
+                              GetModuleHandleW(NULL), NULL);
+    if (!outHwnd) { return false; }
+
+    outDc = GetDC(outHwnd);
+    if (!outDc) {
+        DestroyWindow(outHwnd);
+        outHwnd = NULL;
+        return false;
+    }
+
+    if (!SetPixelFormat(outDc, gamePf, &gamePfd)) {
+        ReleaseDC(outHwnd, outDc);
+        DestroyWindow(outHwnd);
+        outDc = NULL;
+        outHwnd = NULL;
+        return false;
+    }
+    return true;
+}
+
 // Shared capture data (main thread writes, capture thread reads)
 std::vector<ThreadedMirrorConfig> g_threadedMirrorConfigs;
 std::mutex g_threadedMirrorConfigMutex;
@@ -713,7 +771,21 @@ void CleanupCaptureTexture() {
     // Drain the lock-free queue and delete any remaining fences
     FrameCaptureNotification notif;
     while (CaptureQueuePop(notif)) {
-        if (notif.fence) { glDeleteSync(notif.fence); }
+        if (notif.fence && glIsSync(notif.fence)) { glDeleteSync(notif.fence); }
+    }
+
+    // Also clear the render-thread fallback fence. This fence may have been created in a different
+    // share group if the game recreates its GL context; deleting it later from the wrong context
+    // can cause driver instability on some systems.
+    {
+        GLsync old = g_lastCopyFence.exchange(nullptr, std::memory_order_acq_rel);
+        if (old && glIsSync(old)) { glDeleteSync(old); }
+        g_lastCopyReadIndex.store(-1, std::memory_order_release);
+        g_lastCopyWidth.store(0, std::memory_order_release);
+        g_lastCopyHeight.store(0, std::memory_order_release);
+        g_readyFrameIndex.store(-1, std::memory_order_release);
+        g_readyFrameWidth.store(0, std::memory_order_release);
+        g_readyFrameHeight.store(0, std::memory_order_release);
     }
 
     // Delete textures and FBO
@@ -824,7 +896,7 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
         glFlush(); // Ensure fence and resize commands are submitted to GPU
         if (resizeFence) {
             glClientWaitSync(resizeFence, GL_SYNC_FLUSH_COMMANDS_BIT, 500000000ULL); // 500ms timeout
-            glDeleteSync(resizeFence);
+            if (glIsSync(resizeFence)) { glDeleteSync(resizeFence); }
         }
 
         g_copyTextureW = width;
@@ -889,6 +961,15 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     GLsync fenceForMirrorThread = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     GLsync fenceForRenderThread = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
+    // If we failed to allocate sync objects, avoid publishing partially-valid state.
+    // (glClientWaitSync/glWaitSync on a null/invalid fence can crash some drivers.)
+    if (!fenceForMirrorThread || !fenceForRenderThread) {
+        if (fenceForMirrorThread && glIsSync(fenceForMirrorThread)) { glDeleteSync(fenceForMirrorThread); }
+        if (fenceForRenderThread && glIsSync(fenceForRenderThread)) { glDeleteSync(fenceForRenderThread); }
+        restoreState();
+        return;
+    }
+
     // CRITICAL: Flush to ensure commands are submitted and fence is visible to other contexts
     glFlush();
 
@@ -899,7 +980,7 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     // Update accessor variables for render_thread/OBS to use
     // Delete old fence before storing new one (render thread fence management)
     GLsync oldFence = g_lastCopyFence.exchange(fenceForRenderThread, std::memory_order_acq_rel);
-    if (oldFence) { glDeleteSync(oldFence); }
+    if (oldFence && glIsSync(oldFence)) { glDeleteSync(oldFence); }
     g_lastCopyReadIndex.store(writeIndex, std::memory_order_release);
     g_lastCopyWidth.store(width, std::memory_order_release);
     g_lastCopyHeight.store(height, std::memory_order_release);
@@ -908,7 +989,7 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     FrameCaptureNotification notif = { 0, fenceForMirrorThread, width, height, writeIndex };
     if (!CaptureQueuePush(notif)) {
         // Queue full - delete the fence since mirror thread won't get it
-        glDeleteSync(fenceForMirrorThread);
+        if (glIsSync(fenceForMirrorThread)) { glDeleteSync(fenceForMirrorThread); }
     } else {
         // Wake mirror thread so it doesn't have to poll.
         g_captureSignalCV.notify_one();
@@ -1385,7 +1466,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 if (hasNotification) {
                     FrameCaptureNotification newer = {};
                     while (CaptureQueuePop(newer)) {
-                        if (notif.fence) { glDeleteSync(notif.fence); }
+                        if (notif.fence && glIsSync(notif.fence)) { glDeleteSync(notif.fence); }
                         notif = newer;
                     }
                 }
@@ -1412,6 +1493,10 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 GLenum waitResult;
                 {
                     PROFILE_SCOPE_CAT("Waiting for GPU Blit", "Mirror Thread");
+                    if (!notif.fence || !glIsSync(notif.fence)) {
+                        // Invalid fence (can happen across context recreation). Skip this notification.
+                        waitResult = GL_WAIT_FAILED;
+                    } else {
                     // Wait in short slices so the thread remains responsive to stop requests.
                     // Flush once (first iteration) to ensure the fence becomes visible.
                     GLbitfield flags = GL_SYNC_FLUSH_COMMANDS_BIT;
@@ -1420,7 +1505,8 @@ static void MirrorCaptureThreadFunc(void* unused) {
                         flags = 0;
                         if (g_mirrorCaptureShouldStop.load(std::memory_order_relaxed)) { break; }
                     } while (waitResult == GL_TIMEOUT_EXPIRED);
-                    if (notif.fence) { glDeleteSync(notif.fence); }
+                    }
+                    if (notif.fence && glIsSync(notif.fence)) { glDeleteSync(notif.fence); }
                 }
 
                 if (waitResult == GL_WAIT_FAILED) {
@@ -1501,7 +1587,9 @@ static void MirrorCaptureThreadFunc(void* unused) {
                                 if (it->second.backFbo) { glDeleteFramebuffers(1, &it->second.backFbo); }
                                 if (it->second.finalBackFbo) { glDeleteFramebuffers(1, &it->second.finalBackFbo); }
                                 if (it->second.contentDetectionPBO) { glDeleteBuffers(1, &it->second.contentDetectionPBO); }
-                                if (it->second.contentReadbackFence) { glDeleteSync(it->second.contentReadbackFence); }
+                                if (it->second.contentReadbackFence && glIsSync(it->second.contentReadbackFence)) {
+                                    glDeleteSync(it->second.contentReadbackFence);
+                                }
                                 if (it->second.contentDownsampleFbo) { glDeleteFramebuffers(1, &it->second.contentDownsampleFbo); }
                                 if (it->second.contentDownsampleTex) { glDeleteTextures(1, &it->second.contentDownsampleTex); }
                                 it = mt_fbos.erase(it);
@@ -1675,7 +1763,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
                             // If glMapBufferRange returned null, the buffer is not mapped -
                             // do NOT call glUnmapBuffer (it would generate GL_INVALID_OPERATION).
                             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                            glDeleteSync(fb.contentReadbackFence);
+                            if (glIsSync(fb.contentReadbackFence)) { glDeleteSync(fb.contentReadbackFence); }
                             fb.contentReadbackFence = nullptr;
                             fb.contentReadbackPending = false;
                         }
@@ -1739,7 +1827,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
 
                     // Clean up any old fence that wasn't harvested
                     if (fb.contentReadbackFence) {
-                        glDeleteSync(fb.contentReadbackFence);
+                        if (glIsSync(fb.contentReadbackFence)) { glDeleteSync(fb.contentReadbackFence); }
                         fb.contentReadbackFence = nullptr;
                     }
 
@@ -1781,7 +1869,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 // This fence will be swapped along with the texture and waited on by the render thread
                 // before it reads from the texture. This ensures the GPU has finished rendering
                 // even across different OpenGL contexts (which glFinish doesn't guarantee).
-                if (inst->gpuFenceBack) { glDeleteSync(inst->gpuFenceBack); }
+                if (inst->gpuFenceBack && glIsSync(inst->gpuFenceBack)) { glDeleteSync(inst->gpuFenceBack); }
                 inst->gpuFenceBack = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
                 // Defer publishing captureReady until after a single batched glFlush below.
@@ -1822,7 +1910,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
             if (kv.second.backFbo) { glDeleteFramebuffers(1, &kv.second.backFbo); }
             if (kv.second.finalBackFbo) { glDeleteFramebuffers(1, &kv.second.finalBackFbo); }
             if (kv.second.contentDetectionPBO) { glDeleteBuffers(1, &kv.second.contentDetectionPBO); }
-            if (kv.second.contentReadbackFence) { glDeleteSync(kv.second.contentReadbackFence); }
+            if (kv.second.contentReadbackFence && glIsSync(kv.second.contentReadbackFence)) { glDeleteSync(kv.second.contentReadbackFence); }
             if (kv.second.contentDownsampleFbo) { glDeleteFramebuffers(1, &kv.second.contentDownsampleFbo); }
             if (kv.second.contentDownsampleTex) { glDeleteTextures(1, &kv.second.contentDownsampleTex); }
         }
@@ -1865,6 +1953,28 @@ void StartMirrorCaptureThread(void* gameGLContext) {
             // Thread object exists but finished - join it before starting new one
             Log("Mirror Capture Thread: Joining finished thread...");
             g_mirrorCaptureThread.join();
+
+            // If the previous thread exited early (exception), it may not have cleaned up.
+            if (!g_mirrorContextIsShared && g_mirrorCaptureContext) {
+                wglDeleteContext(g_mirrorCaptureContext);
+                g_mirrorCaptureContext = NULL;
+            }
+            if (!g_mirrorContextIsShared) {
+                if (g_mirrorOwnedDCHwnd && g_mirrorCaptureDC) {
+                    ReleaseDC(g_mirrorOwnedDCHwnd, g_mirrorCaptureDC);
+                }
+                g_mirrorOwnedDCHwnd = NULL;
+
+                if (g_mirrorFallbackDummyHwnd && g_mirrorFallbackDummyDC) {
+                    ReleaseDC(g_mirrorFallbackDummyHwnd, g_mirrorFallbackDummyDC);
+                    g_mirrorFallbackDummyDC = NULL;
+                }
+                if (g_mirrorFallbackDummyHwnd) {
+                    DestroyWindow(g_mirrorFallbackDummyHwnd);
+                    g_mirrorFallbackDummyHwnd = NULL;
+                }
+                g_mirrorCaptureDC = NULL;
+            }
         }
     }
 
@@ -1882,25 +1992,47 @@ void StartMirrorCaptureThread(void* gameGLContext) {
         // Fallback: Create and share context now
         g_mirrorContextIsShared = false;
 
-        // Get current DC for context creation
-        HDC hdc = wglGetCurrentDC();
-        if (!hdc) {
+        // Get current (game) DC. Prefer the actual current DC.
+        HDC gameHdc = wglGetCurrentDC();
+        HWND gameHwndForDC = NULL;
+        if (!gameHdc) {
             HWND hwnd = g_minecraftHwnd.load();
-            if (hwnd) { hdc = GetDC(hwnd); }
+            if (hwnd) {
+                gameHdc = GetDC(hwnd);
+                gameHwndForDC = hwnd;
+            }
         }
 
-        if (!hdc) {
+        if (!gameHdc) {
             Log("Mirror Capture Thread: No DC available");
             return;
         }
 
-        // Store DC for thread use
-        g_mirrorCaptureDC = hdc;
+        // Prefer a dedicated dummy DC for the worker context.
+        if (MT_CreateFallbackDummyWindowWithMatchingPixelFormat(gameHdc, L"mirror", g_mirrorFallbackDummyHwnd, g_mirrorFallbackDummyDC) &&
+            g_mirrorFallbackDummyDC) {
+            g_mirrorCaptureDC = g_mirrorFallbackDummyDC;
+            // If we called GetDC(hwnd) only to query the pixel format, release it now.
+            if (gameHwndForDC) {
+                ReleaseDC(gameHwndForDC, gameHdc);
+                gameHwndForDC = NULL;
+            }
+            g_mirrorOwnedDCHwnd = NULL;
+        } else {
+            // Fall back to using the game HDC (less stable on some drivers).
+            g_mirrorCaptureDC = gameHdc;
+            g_mirrorOwnedDCHwnd = gameHwndForDC; // Release on StopMirrorCaptureThread if non-null
+        }
 
         // Create the capture context on main thread
-        g_mirrorCaptureContext = wglCreateContext(hdc);
+        g_mirrorCaptureContext = wglCreateContext(g_mirrorCaptureDC);
         if (!g_mirrorCaptureContext) {
             Log("Mirror Capture Thread: Failed to create GL context (error " + std::to_string(GetLastError()) + ")");
+            if (g_mirrorOwnedDCHwnd && g_mirrorCaptureDC) {
+                ReleaseDC(g_mirrorOwnedDCHwnd, g_mirrorCaptureDC);
+                g_mirrorOwnedDCHwnd = NULL;
+                g_mirrorCaptureDC = NULL;
+            }
             return;
         }
 
@@ -1955,6 +2087,32 @@ void StopMirrorCaptureThread() {
     if (g_mirrorCaptureThread.joinable()) { g_mirrorCaptureThread.join(); }
 
     Log("Mirror Capture Thread: Joined");
+
+    // If the mirror thread crashed, it may not have reached its normal cleanup path.
+    // Ensure the fallback context is deleted here to avoid leaking contexts/share-groups.
+    if (!g_mirrorContextIsShared && g_mirrorCaptureContext) {
+        wglDeleteContext(g_mirrorCaptureContext);
+        g_mirrorCaptureContext = NULL;
+    }
+
+    // Destroy fallback dummy window/DC on the main thread after join.
+    if (!g_mirrorContextIsShared) {
+        if (g_mirrorOwnedDCHwnd && g_mirrorCaptureDC) {
+            ReleaseDC(g_mirrorOwnedDCHwnd, g_mirrorCaptureDC);
+        }
+        g_mirrorOwnedDCHwnd = NULL;
+
+        if (g_mirrorFallbackDummyHwnd && g_mirrorFallbackDummyDC) {
+            ReleaseDC(g_mirrorFallbackDummyHwnd, g_mirrorFallbackDummyDC);
+            g_mirrorFallbackDummyDC = NULL;
+        }
+        if (g_mirrorFallbackDummyHwnd) {
+            DestroyWindow(g_mirrorFallbackDummyHwnd);
+            g_mirrorFallbackDummyHwnd = NULL;
+        }
+
+        g_mirrorCaptureDC = NULL;
+    }
 }
 
 // Swap buffers for all mirrors that have new captures ready
