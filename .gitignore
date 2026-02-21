@@ -7,3 +7,5 @@
 !src/gui/**
 !src/*.toml
 !src/*.png
+!src/*.rc
+!CMakeLists.txt

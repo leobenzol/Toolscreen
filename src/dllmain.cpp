@@ -36,12 +36,6 @@
 #include <thread>
 #include <windowsx.h>
 
-#pragma comment(lib, "Comdlg32.lib")
-#pragma comment(lib, "Msimg32.lib")
-#pragma comment(lib, "opengl32.lib")
-#pragma comment(lib, "libglew32.lib")
-#pragma comment(lib, "DbgHelp.lib")
-
 #define STB_IMAGE_IMPLEMENTATION
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_win32.h"
