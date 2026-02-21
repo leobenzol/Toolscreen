@@ -1006,7 +1006,7 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 std::string targetMode;
 
                 if (EqualsIgnoreCase(current, currentSecMode)) {
-                    targetMode = "Fullscreen";
+                    targetMode = cfg.defaultMode;
                 } else {
                     targetMode = currentSecMode;
                 }
