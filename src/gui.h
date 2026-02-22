@@ -467,6 +467,7 @@ struct Config {
     // Hotkey to toggle borderless-windowed fullscreen for the game window.
     // Empty = disabled/unbound.
     std::vector<DWORD> borderlessHotkey = {};
+    bool autoBorderless = false;
     // Hotkeys to toggle overlay visibility (runtime only; does not change mode config).
     // Empty = disabled/unbound.
     std::vector<DWORD> imageOverlaysHotkey = {};

@@ -254,6 +254,7 @@ inline std::vector<DWORD> GetDefaultGuiHotkey() { return { VK_LCONTROL, 'I' }; }
 
 // Default borderless toggle hotkey: unbound/disabled
 inline std::vector<DWORD> GetDefaultBorderlessHotkey() { return {}; }
+constexpr bool CONFIG_AUTO_BORDERLESS = false;
 
 // Default overlay visibility toggle hotkeys: unbound/disabled
 inline std::vector<DWORD> GetDefaultImageOverlaysHotkey() { return {}; }
