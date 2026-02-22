@@ -109,6 +109,21 @@ if (ImGui::BeginTabItem("Other")) {
     HelpMarker("Toggles the game window between its previous windowed size and a borderless, monitor-sized window.");
     ImGui::PopID();
 
+    // Auto-Borderless toggle
+    {
+        ImGui::PushID("basic_auto_borderless");
+        ImGui::Text("Auto-Borderless:");
+        ImGui::SameLine();
+        const char* label = g_config.autoBorderless ? "Enabled" : "Disabled";
+        if (ImGui::Button(label, ImVec2(150, 0))) {
+            g_config.autoBorderless = !g_config.autoBorderless;
+            g_configIsDirty = true;
+        }
+        ImGui::SameLine();
+        HelpMarker("Automatically puts Minecraft in borderless mode when the window is detected on startup.");
+        ImGui::PopID();
+    }
+
     // --- DISPLAY SETTINGS ---
     ImGui::SeparatorText("Display Settings");
 
