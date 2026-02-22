@@ -1462,6 +1462,7 @@ void ConfigToToml(const Config& config, toml::table& out) {
     toml::array borderlessHotkeyArr;
     for (const auto& key : config.borderlessHotkey) { borderlessHotkeyArr.push_back(static_cast<int64_t>(key)); }
     out.insert("borderlessHotkey", borderlessHotkeyArr);
+    out.insert("autoBorderless", config.autoBorderless);
 
     // Overlay visibility toggle hotkeys (optional)
     toml::array imageOverlaysHotkeyArr;
@@ -1601,6 +1602,7 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
         }
     }
     if (!hasBorderlessHotkey) { config.borderlessHotkey = ConfigDefaults::GetDefaultBorderlessHotkey(); }
+    config.autoBorderless = GetOr(tbl, "autoBorderless", ConfigDefaults::CONFIG_AUTO_BORDERLESS);
 
     // Overlay visibility toggle hotkeys (optional; empty array = disabled)
     config.imageOverlaysHotkey.clear();
@@ -1756,6 +1758,7 @@ bool SaveConfigToTomlFile(const Config& config, const std::wstring& path) {
                                                  "disableConfigurePrompt",
                                                  "guiHotkey",
                                                  "borderlessHotkey",
+                                                 "autoBorderless",
                                                  "imageOverlaysHotkey",
                                                  "windowOverlaysHotkey",
                                                  "debug",

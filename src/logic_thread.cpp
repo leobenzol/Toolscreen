@@ -524,6 +524,21 @@ void CheckGameStateReset() {
     s_previousGameStateForReset = localGameState;
 }
 
+static void CheckAutoBorderless() {
+    static bool s_checked = false;
+    if (s_checked) { return; }
+
+    HWND hwnd = g_minecraftHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) { return; }
+
+    s_checked = true;
+
+    if (!g_config.autoBorderless) { return; }
+
+    ToggleBorderlessWindowedFullscreen(hwnd);
+    Log("[LogicThread] Auto-borderless applied");
+}
+
 static void LogicThreadFunc() {
     LogCategory("init", "[LogicThread] Started");
 
@@ -556,6 +571,7 @@ static void LogicThreadFunc() {
         ProcessPendingModeSwitch();
         ProcessPendingDimensionChange();
         CheckGameStateReset();
+        CheckAutoBorderless();
 
         // Sleep for remaining time in tick
         auto tickEnd = std::chrono::steady_clock::now();
